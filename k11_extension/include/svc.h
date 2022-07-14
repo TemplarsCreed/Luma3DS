@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -32,7 +32,9 @@
 #include "utils.h"
 
 extern void *officialSVCs[0x7E];
+extern void *alteredSvcTable[0x100];
+
+void buildAlteredSvcTable(void);
 
 void postprocessSvc(void);
 void svcDefaultHandler(u8 svcId);
-void *svcHook(u8 *pageEnd);

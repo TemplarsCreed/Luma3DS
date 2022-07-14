@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -23,18 +23,20 @@
 *         or requiring that modified versions of such material be marked in
 *         reasonable ways as different from the original version.
 */
+#include <string.h>
 
 #include "svc/KernelSetState.h"
 #include "synchronization.h"
 #include "ipc.h"
 #include "debug.h"
-#include "memory.h"
 
 #define MAX_DEBUG 3
 
 static u32 nbEnabled = 0;
 static u32 maskedPids[MAX_DEBUG];
 static u32 masks[MAX_DEBUG][8] = {0};
+
+bool svcSignalingEnabled = false;
 
 bool shouldSignalSyscallDebugEvent(KProcess *process, u8 svcId)
 {
@@ -65,6 +67,7 @@ Result SetSyscallDebugEventMask(u32 pid, bool enable, const u32 *mask)
     {
         maskedPids[nbEnabled] = pid;
         memcpy(&masks[nbEnabled++], tmpMask, 32);
+        svcSignalingEnabled = true;
     }
     else
     {
@@ -84,6 +87,7 @@ Result SetSyscallDebugEventMask(u32 pid, bool enable, const u32 *mask)
         }
         maskedPids[--nbEnabled] = 0;
         memset(&masks[nbEnabled], 0, 32);
+        svcSignalingEnabled = false;
     }
 
     KRecursiveLock__Unlock(&syscallDebugEventMaskLock);
@@ -104,14 +108,22 @@ Result KernelSetStateHook(u32 type, u32 varg1, u32 varg2, u32 varg3)
                 __ldrex((s32 *)&rosalinaState);
             }
             while(__strex((s32 *)&rosalinaState, (s32)(rosalinaState ^ varg1)));
+            __dmb();
 
-            if(rosalinaState & 2)
+            if(rosalinaState & 0x10)
                 hasStartedRosalinaNetworkFuncsOnce = true;
 
-            if(rosalinaState & 1)
-                rosalinaLockAllThreads();
-            else if(varg1 & 1)
-                rosalinaUnlockAllThreads();
+            // 1: all applet/app/dsp/csnd... threads 2: gsp 4: hid/ir
+            for (u32 v = 4; v != 0; v >>= 1)
+            {
+                if (varg1 & v)
+                {
+                    if (rosalinaState & v)
+                        rosalinaLockThreads(v);
+                    else
+                        rosalinaUnlockThreads(v);
+                }
+            }
 
             break;
         }

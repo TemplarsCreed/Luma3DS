@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -23,9 +23,9 @@
 *         or requiring that modified versions of such material be marked in
 *         reasonable ways as different from the original version.
 */
+#include <string.h>
 
 #include "svc/ControlService.h"
-#include "memory.h"
 #include "ipc.h"
 
 Result ControlService(ServiceOp op, u32 varg1, u32 varg2)
@@ -73,14 +73,11 @@ Result ControlService(ServiceOp op, u32 varg1, u32 varg2)
         {
             char name[12] = { 0 };
             SessionInfo *info = NULL;
-            if(name != NULL)
-            {
-                s32 nb = usrToKernelStrncpy(name, (const char *)varg2, 12);
-                if(nb < 0)
-                    return 0xD9001814;
-                else if(nb == 12 && name[11] != 0)
-                    return 0xE0E0181E;
-            }
+            s32 nb = usrToKernelStrncpy(name, (const char *)varg2, 12);
+            if(nb < 0)
+                return 0xD9001814;
+            else if(nb == 12 && name[11] != 0)
+                return 0xE0E0181E;
 
             info = SessionInfo_FindFirst(name);
 

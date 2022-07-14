@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -23,11 +23,11 @@
 *         or requiring that modified versions of such material be marked in
 *         reasonable ways as different from the original version.
 */
+#include <string.h>
 
 #include "fatalExceptionHandlers.h"
 #include "utils.h"
 #include "kernel.h"
-#include "memory.h"
 #include "globals.h"
 
 #define REG_DUMP_SIZE   4 * 23
@@ -81,7 +81,7 @@ void fatalExceptionHandlersMain(u32 *registerDump, u32 type, u32 cpuId)
     dumpHeader.magic[0] = 0xDEADC0DE;
     dumpHeader.magic[1] = 0xDEADCAFE;
     dumpHeader.versionMajor = 1;
-    dumpHeader.versionMinor = 2;
+    dumpHeader.versionMinor = 3;
 
     dumpHeader.processor = 11;
     dumpHeader.core = cpuId & 0xF;

@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -127,11 +127,16 @@ typedef struct CfwInfo
 
     u16 configFormatVersionMajor, configFormatVersionMinor;
     u32 config, multiConfig, bootConfig;
+    u32 splashDurationMsec;
     u64 hbldr3dsxTitleId;
     u32 rosalinaMenuCombo;
+    u16 screenFiltersCct;
+    s16 ntpTzOffetMinutes;
 } CfwInfo;
 
 extern CfwInfo cfwInfo;
+extern u32 kextBasePa;
+extern u32 stolenSystemMemRegionSize;
 
 extern vu32 rosalinaState;
 extern bool hasStartedRosalinaNetworkFuncsOnce;

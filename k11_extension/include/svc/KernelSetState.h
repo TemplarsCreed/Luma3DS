@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -29,6 +29,8 @@
 #include "utils.h"
 #include "kernel.h"
 #include "svc.h"
+
+extern bool svcSignalingEnabled;
 
 bool shouldSignalSyscallDebugEvent(KProcess *process, u8 svcId);
 Result KernelSetStateHook(u32 type, u32 varg1, u32 varg2, u32 varg3);

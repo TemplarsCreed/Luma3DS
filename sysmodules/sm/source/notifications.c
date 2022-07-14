@@ -1,12 +1,24 @@
 /*
 notifications.c
 
-(c) TuxSH, 2017
+(c) TuxSH, 2017-2020
 This is part of 3ds_sm, which is licensed under the MIT license (see LICENSE for details).
 */
 
 #include "notifications.h"
 #include "processes.h"
+
+#include <stdatomic.h>
+
+static bool isNotificationInhibited(const ProcessData *processData, u32 notificationId)
+{
+    (void)processData;
+    switch(notificationId)
+    {
+        default:
+            return false;
+    }
+}
 
 static bool doPublishNotification(ProcessData *processData, u32 notificationId, u32 flags)
 {
@@ -14,7 +26,7 @@ static bool doPublishNotification(ProcessData *processData, u32 notificationId, 
     {
         for(u16 i = 0; i < processData->nbPendingNotifications; i++)
         {
-            if(processData->pendingNotifications[(processData->pendingNotificationIndex + i) % 16] == notificationId)
+            if(processData->pendingNotifications[(processData->receivedNotificationIndex + i) % 16] == notificationId)
                 return true;
         }
     }
@@ -101,7 +113,7 @@ Result ReceiveNotification(SessionData *sessionData, u32 *notificationId)
 
     if(processData == NULL || !processData->notificationEnabled || processData->nbPendingNotifications == 0)
     {
-        if(processData->nbPendingNotifications)
+        if(processData != NULL && processData->nbPendingNotifications)
             *notificationId = 0;
         return 0xD8806404;
     }
@@ -118,7 +130,7 @@ Result PublishToSubscriber(u32 notificationId, u32 flags)
 {
     for(ProcessData *node = processDataInUseList.first; node != NULL; node = node->next)
     {
-        if(!node->notificationEnabled)
+        if(!node->notificationEnabled || isNotificationInhibited(node, notificationId))
             continue;
 
         u16 i;
@@ -138,7 +150,7 @@ Result PublishAndGetSubscriber(u32 *pidCount, u32 *pidList, u32 notificationId, 
     u32 nb = 0;
     for(ProcessData *node = processDataInUseList.first; node != NULL; node = node->next)
     {
-        if(!node->notificationEnabled)
+        if(!node->notificationEnabled || isNotificationInhibited(node, notificationId))
             continue;
 
         u16 i;

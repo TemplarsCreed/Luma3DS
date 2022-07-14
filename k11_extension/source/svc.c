@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@
 *         reasonable ways as different from the original version.
 */
 
-#include "memory.h"
+#include <string.h>
 #include "synchronization.h"
 #include "svc.h"
 #include "svc/ControlMemory.h"
@@ -32,7 +32,6 @@
 #include "svc/GetSystemInfo.h"
 #include "svc/GetProcessInfo.h"
 #include "svc/GetThreadInfo.h"
-#include "svc/GetCFWInfo.h"
 #include "svc/ConnectToPort.h"
 #include "svc/SendSyncRequest.h"
 #include "svc/Break.h"
@@ -48,124 +47,78 @@
 #include "svc/TranslateHandle.h"
 
 void *officialSVCs[0x7E] = {NULL};
+void *alteredSvcTable[0x100] = {NULL};
 
-void signalSvcEntry(u8 *pageEnd)
+static Result BreakHook(UserBreakType breakReason, const void* croInfo, u32 croInfoSize)
 {
-    u32 svcId = (u32) *(u8 *)(pageEnd - 0xB5);
     KProcess *currentProcess = currentCoreContext->objectContext.currentProcess;
 
-    if(svcId == 0xFE)
-        svcId = *(u32 *)(pageEnd - 0x110 + 8 * 4); // r12 ; note: max theortical SVC atm: 0x3FFFFFFF. We don't support catching svcIds >= 0x100 atm either
+    void *funptr = (debugOfProcess(currentProcess) != NULL) ? officialSVCs[0x3C] : (void *)Break;
+    return ((Result (*)(UserBreakType, const void *, u32))funptr)(breakReason, croInfo, croInfoSize);
+}
+
+void buildAlteredSvcTable(void)
+{
+    memcpy(alteredSvcTable, officialSVCs, 4 * 0x7E);
+
+    alteredSvcTable[0x01] = ControlMemoryHookWrapper;
+
+    alteredSvcTable[0x29] = GetHandleInfoHookWrapper;
+    alteredSvcTable[0x2A] = GetSystemInfoHookWrapper;
+    alteredSvcTable[0x2B] = GetProcessInfoHookWrapper;
+    alteredSvcTable[0x2C] = GetThreadInfoHookWrapper;
+    alteredSvcTable[0x2D] = ConnectToPortHookWrapper;
+
+    alteredSvcTable[0x32] = SendSyncRequestHook;
+    alteredSvcTable[0x3C] = BreakHook;
+
+    alteredSvcTable[0x59] = SetGpuProt;
+    alteredSvcTable[0x5A] = SetWifiEnabled;
+
+    alteredSvcTable[0x7B] = Backdoor;
+    alteredSvcTable[0x7C] = KernelSetStateHook;
+
+    // Custom SVCs past that point
+    alteredSvcTable[0x80] = CustomBackdoor;
+
+    alteredSvcTable[0x90] = convertVAToPA;
+    alteredSvcTable[0x91] = flushDataCacheRange;
+    alteredSvcTable[0x92] = flushEntireDataCache;
+    alteredSvcTable[0x93] = invalidateInstructionCacheRange;
+    alteredSvcTable[0x94] = invalidateEntireInstructionCache;
+
+    alteredSvcTable[0xA0] = MapProcessMemoryEx;
+    alteredSvcTable[0xA1] = UnmapProcessMemoryEx;
+    alteredSvcTable[0xA2] = ControlMemoryEx;
+
+    alteredSvcTable[0xB0] = ControlService;
+    alteredSvcTable[0xB1] = CopyHandleWrapper;
+    alteredSvcTable[0xB2] = TranslateHandleWrapper;
+}
+
+void signalSvcEntry(u32 svcId)
+{
+    KProcess *currentProcess = currentCoreContext->objectContext.currentProcess;
 
     // Since DBGEVENT_SYSCALL_ENTRY is non blocking, we'll cheat using EXCEVENT_UNDEFINED_SYSCALL (debug->svcId is fortunately an u16!)
-    if(debugOfProcess(currentProcess) != NULL && shouldSignalSyscallDebugEvent(currentProcess, svcId))
+    if(debugOfProcess(currentProcess) != NULL && svcId != 0xFF && shouldSignalSyscallDebugEvent(currentProcess, svcId))
         SignalDebugEvent(DBGEVENT_OUTPUT_STRING, 0xFFFFFFFE, svcId);
 }
 
-void signalSvcReturn(u8 *pageEnd)
+void signalSvcReturn(u32 svcId)
 {
-    u32 svcId = (u32) *(u8 *)(pageEnd - 0xB5);
     KProcess *currentProcess = currentCoreContext->objectContext.currentProcess;
 
-    if(svcId == 0xFE)
-        svcId = *(u32 *)(pageEnd - 0x110 + 8 * 4); // r12 ; note: max theortical SVC atm: 0x1FFFFFFF. We don't support catching svcIds >= 0x100 atm either
-
     // Since DBGEVENT_SYSCALL_RETURN is non blocking, we'll cheat using EXCEVENT_UNDEFINED_SYSCALL (debug->svcId is fortunately an u16!)
-    if(debugOfProcess(currentProcess) != NULL && shouldSignalSyscallDebugEvent(currentProcess, svcId))
+    if(debugOfProcess(currentProcess) != NULL && svcId != 0xFF && shouldSignalSyscallDebugEvent(currentProcess, svcId))
         SignalDebugEvent(DBGEVENT_OUTPUT_STRING, 0xFFFFFFFF, svcId);
 }
 
 void postprocessSvc(void)
 {
     KThread *currentThread = currentCoreContext->objectContext.currentThread;
-    if(!currentThread->shallTerminate && rosalinaThreadLockPredicate(currentThread))
+    if(!currentThread->shallTerminate && rosalinaThreadLockPredicate(currentThread, rosalinaState & 5))
         rosalinaRescheduleThread(currentThread, true);
 
     officialPostProcessSvc();
-}
-
-static bool doingVeryShittyPmResLimitWorkaround = false; // I feel dirty
-
-void *svcHook(u8 *pageEnd)
-{
-    KProcess *currentProcess = currentCoreContext->objectContext.currentProcess;
-
-    u32 svcId = *(u8 *)(pageEnd - 0xB5);
-    if(svcId == 0xFE)
-        svcId = *(u32 *)(pageEnd - 0x110 + 8 * 4); // r12 ; note: max theortical SVC atm: 0x3FFFFFFF. We don't support catching svcIds >= 0x100 atm either
-    switch(svcId)
-    {
-        case 0x01:
-            return ControlMemoryHookWrapper;
-        case 0x17:
-            if(strcmp(codeSetOfProcess(currentProcess)->processName, "pm") == 0) // only called twice in pm, by the same function
-            {
-                *(vu32 *)(configPage + 0x44) += __end__ - __start__;
-                doingVeryShittyPmResLimitWorkaround = true;
-            }
-            return officialSVCs[0x17];
-        case 0x29:
-            return GetHandleInfoHookWrapper;
-        case 0x2A:
-            return GetSystemInfoHookWrapper;
-        case 0x2B:
-            return GetProcessInfoHookWrapper;
-        case 0x2C:
-            return GetThreadInfoHookWrapper;
-        case 0x2D:
-            return ConnectToPortHookWrapper;
-        case 0x2E:
-            return GetCFWInfo; // DEPRECATED
-        case 0x32:
-            return SendSyncRequestHook;
-        case 0x3C:
-            return (debugOfProcess(currentProcess) != NULL) ? officialSVCs[0x3C] : (void *)Break;
-        case 0x59:
-            return SetGpuProt;
-        case 0x5A:
-            return SetWifiEnabled;
-        case 0x79:
-            if(doingVeryShittyPmResLimitWorkaround)
-            {
-                *(vu32 *)(configPage + 0x44) -= __end__ - __start__;
-                doingVeryShittyPmResLimitWorkaround = false;
-            }
-            return officialSVCs[0x79];
-        case 0x7B:
-            return Backdoor;
-        case 0x7C:
-            return KernelSetStateHook;
-
-
-        case 0x80:
-            return CustomBackdoor;
-
-        case 0x90:
-            return convertVAToPA;
-        case 0x91:
-            return flushDataCacheRange;
-        case 0x92:
-            return flushEntireDataCache;
-        case 0x93:
-            return invalidateInstructionCacheRange;
-        case 0x94:
-            return invalidateEntireInstructionCache;
-
-        case 0xA0:
-            return MapProcessMemoryEx;
-        case 0xA1:
-            return UnmapProcessMemoryEx;
-        case 0xA2:
-            return ControlMemoryEx;
-
-        case 0xB0:
-            return ControlService;
-        case 0xB1:
-            return CopyHandleWrapper;
-        case 0xB2:
-            return TranslateHandleWrapper;
-
-        default:
-            return (svcId <= 0x7D) ? officialSVCs[svcId] : NULL;
-    }
 }

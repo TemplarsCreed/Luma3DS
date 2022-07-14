@@ -1,29 +1,11 @@
 /*
-*   This file is part of Luma3DS
-*   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+*   This file is part of Luma3DS.
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
-*   This program is free software: you can redistribute it and/or modify
-*   it under the terms of the GNU General Public License as published by
-*   the Free Software Foundation, either version 3 of the License, or
-*   (at your option) any later version.
-*
-*   This program is distributed in the hope that it will be useful,
-*   but WITHOUT ANY WARRANTY; without even the implied warranty of
-*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*   GNU General Public License for more details.
-*
-*   You should have received a copy of the GNU General Public License
-*   along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*   Additional Terms 7.b and 7.c of GPLv3 apply to this file:
-*       * Requiring preservation of specified reasonable legal notices or
-*         author attributions in that material or in the Appropriate Legal
-*         Notices displayed by works containing it.
-*       * Prohibiting misrepresentation of the origin of that material,
-*         or requiring that modified versions of such material be marked in
-*         reasonable ways as different from the original version.
+*   SPDX-License-Identifier: (MIT OR GPL-2.0-or-later)
 */
 
+#define _GNU_SOURCE
 #include "gdb/query.h"
 #include "gdb/xfer.h"
 #include "gdb/thread.h"
@@ -108,11 +90,23 @@ int GDB_HandleWriteQuery(GDBContext *ctx)
 
 GDB_DECLARE_QUERY_HANDLER(Supported)
 {
+    const char *pos = ctx->commandData, *nextpos = pos;
+    do
+    {
+        pos = nextpos;
+        nextpos = strchrnul(pos, ';');
+        if (*nextpos != ';' && *nextpos != '\0')
+            return GDB_ReplyErrno(ctx, EILSEQ);
+
+        if (strncmp(pos, "multiprocess+", nextpos - pos) == 0)
+            ctx->multiprocessExtEnabled = true;
+    } while (*nextpos++ != '\0');
+
     return GDB_SendFormattedPacket(ctx,
         "PacketSize=%x;"
         "qXfer:features:read+;qXfer:osdata:read+;"
         "QStartNoAckMode+;QThreadEvents+;QCatchSyscalls+;"
-        "vContSupported+;swbreak+",
+        "vContSupported+;swbreak+;multiprocess+",
 
         GDB_BUF_LEN // should have been sizeof(ctx->buffer) but GDB memory functions are bugged
     );
@@ -120,13 +114,13 @@ GDB_DECLARE_QUERY_HANDLER(Supported)
 
 GDB_DECLARE_QUERY_HANDLER(StartNoAckMode)
 {
-    ctx->state = GDB_STATE_NOACK_SENT;
+    ctx->noAckSent = true;
     return GDB_ReplyOk(ctx);
 }
 
 GDB_DECLARE_QUERY_HANDLER(Attached)
 {
-    return GDB_SendPacket(ctx, "1", 1);
+    return GDB_SendPacket(ctx, (ctx->flags & GDB_FLAG_CREATED) ? "0" :  "1", 1);
 }
 
 GDB_DECLARE_QUERY_HANDLER(CatchSyscalls)

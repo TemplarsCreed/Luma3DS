@@ -1,5 +1,5 @@
 @   This file is part of Luma3DS
-@   Copyright (C) 2016-2017 Aurora Wright, TuxSH
+@   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 @
 @   This program is free software: you can redistribute it and/or modify
 @   it under the terms of the GNU General Public License as published by
@@ -22,22 +22,7 @@
 @         or requiring that modified versions of such material be marked in
 @         reasonable ways as different from the original version.
 
-.macro TEST_IF_MODE_AND_ARM_INST_OR_JUMP lbl, mode
-    cpsid aif
-    mrs sp, spsr
-    tst sp, #0x20
-    bne \lbl
-    and sp, #0x1f                @ get previous processor mode
-    cmp sp, #\mode
-    bne \lbl
-
-    sub sp, lr, #4
-    mcr p15, 0, sp, c7, c8, 0    @ VA to PA translation with privileged read permission check
-    mrc p15, 0, sp, c7, c4, 0    @ read PA register
-    tst sp, #1                   @ failure bit
-    bne \lbl
-.endm
-
+.fpu vfp
 
 .macro GEN_USUAL_HANDLER name, index, pos
     \name\()Handler:
@@ -178,14 +163,20 @@ _commonHandler:
 .type   FIQHandler, %function
 GEN_USUAL_HANDLER FIQ, 0, 28
 
+.align  5
 .global undefinedInstructionHandler
 .type   undefinedInstructionHandler, %function
 undefinedInstructionHandler:
-    TEST_IF_MODE_AND_ARM_INST_OR_JUMP _undefinedInstructionNormalHandler, 0x10
+    @ Most of the time, we're here to re-enable the FPU (over and over again)
+    mrs sp, spsr
+    @ We can assume bit4 is always set in SPSR. Test if if it's not thumb and if it's usermode
+    tst sp, #0x2F
+    bne _undefinedInstructionNormalHandler
 
-    ldr sp, [lr, #-4]   @ test if it's an VFP instruction that was aborted
+    @ Test if it's an VFP instruction that was aborted
+    ldr sp, [lr, #-4]
     lsl sp, #4
-    sub sp, #0xc0000000
+    sub sp, #0xC0000000
     cmp sp, #0x30000000
     bcs _undefinedInstructionNormalHandler
     fmrx sp, fpexc
@@ -210,8 +201,6 @@ undefinedInstructionHandler:
 .global prefetchAbortHandler
 .type   prefetchAbortHandler, %function
 prefetchAbortHandler:
-    TEST_IF_MODE_AND_ARM_INST_OR_JUMP _prefetchAbortNormalHandler, 0x13
-
     ldr sp, =(Break + 3*4 + 4)
     cmp lr, sp
     bne _prefetchAbortNormalHandler
@@ -249,4 +238,4 @@ dataAbortHandler:
 .bss
 .balign 4
 _regs: .skip (4 * 23)
-_fatalExceptionOccured: .word 0
+_fatalExceptionOccured: .skip 4
