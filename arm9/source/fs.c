@@ -52,27 +52,50 @@ static bool switchToMainDir(bool isSd)
         case FR_OK:
             return true;
         case FR_NO_PATH:
-            return f_mkdir(mainDir) == FR_OK && switchToMainDir(isSd);
+        {
+            if (f_mkdir(mainDir) != FR_OK)
+            {
+                error("Failed to create luma directory.");
+                return false;
+            }
+            return switchToMainDir(isSd);
+        }
         default:
             return false;
     }
 }
 
-bool mountFs(bool isSd, bool switchToCtrNand)
+bool mountSdCardPartition(bool switchMainDir)
 {
-    static bool sdInitialized = false, nandInitialized = false;
-    if (isSd)
+    static bool sdInitialized = false;
+    if (!sdInitialized)
+        sdInitialized = f_mount(&sdFs, "sdmc:", 1) == FR_OK;
+
+    if (sdInitialized && switchMainDir)
+        return f_chdrive("sdmc:") == FR_OK && switchToMainDir(true);
+    return sdInitialized;
+}
+
+bool remountCtrNandPartition(bool switchMainDir)
+{
+    static bool nandInitialized = false;
+    int res = FR_OK;
+
+    if (!nandInitialized)
     {
-        if (!sdInitialized)
-            sdInitialized = f_mount(&sdFs, "0:", 1) == FR_OK;
-        return sdInitialized && switchToMainDir(true);
+        res = f_mount(&nandFs, "nand:", 1);
+        nandInitialized = res == FR_OK;
     }
-    else
-    {
-        if (!nandInitialized)
-            nandInitialized = f_mount(&nandFs, "1:", 1) == FR_OK;
-        return nandInitialized && (!switchToCtrNand || (f_chdrive("1:") == FR_OK && switchToMainDir(false)));
-    }
+
+    if (nandInitialized && switchMainDir)
+        return f_chdrive("nand:") == FR_OK && switchToMainDir(false);
+    return nandInitialized;
+}
+
+void unmountPartitions(void)
+{
+    f_unmount("nand:");
+    f_unmount("sdmc:");
 }
 
 u32 fileRead(void *dest, const char *path, u32 maxSize)
@@ -114,6 +137,7 @@ bool fileWrite(const void *buffer, const char *path, u32 size)
             return result == FR_OK && (u32)written == size;
         }
         case FR_NO_PATH:
+            // Only create the last dir in the hierarchy
             for(u32 i = 1; path[i] != 0; i++)
                 if(path[i] == '/')
                 {
@@ -155,6 +179,7 @@ bool fileCopy(const char *pathSrc, const char *pathDst, bool replace, void *tmpB
     }
     else if (res == FR_NO_PATH)
     {
+        // Only create the last dir in the hierarchy
         const char *c;
         for (c = pathDst + strlen(pathDst); *c != '/' && c >= pathDst; --c);
         if (c >= pathDst && c - pathDst <= FF_MAX_LFN && *c != '\0')
@@ -183,7 +208,7 @@ bool fileCopy(const char *pathSrc, const char *pathDst, bool replace, void *tmpB
         res = f_read(&fileSrc, tmpBuffer, sz, &n);
         if (n != sz)
             res = FR_INT_ERR; // should not happen
-        
+
         if (res == FR_OK)
         {
             res = f_write(&fileDst, tmpBuffer, sz, &n);
@@ -205,6 +230,12 @@ bool fileCopy(const char *pathSrc, const char *pathDst, bool replace, void *tmpB
     f_close(&fileDst);
 
     return true;
+}
+
+bool createDir(const char *path)
+{
+    FRESULT res = f_mkdir(path);
+    return res == FR_OK || res == FR_EXIST;
 }
 
 bool findPayload(char *path, u32 pressed)
@@ -343,10 +374,10 @@ u32 firmRead(void *dest, u32 firmType)
                                            {"00000003", "20000003"},
                                            {"00000001", "20000001"}};
 
-    char folderPath[35],
-         path[48];
+    char folderPath[64],
+         path[128];
 
-    sprintf(folderPath, "1:/title/00040138/%s/content", firmFolders[firmType][ISN3DS ? 1 : 0]);
+    sprintf(folderPath, "nand:/title/00040138/%s/content", firmFolders[firmType][ISN3DS ? 1 : 0]);
 
     DIR dir;
     u32 firmVersion = 0xFFFFFFFF;
@@ -412,22 +443,38 @@ static bool backupEssentialFiles(void)
 {
     size_t sz = sizeof(fileCopyBuffer);
 
-    bool ok = !(isSdMode && !mountFs(false, false));
+    u32 deviceID = *(vu32*)0x01FFB804;
+    char pathStart[0x20];
+    sprintf(pathStart, "backups/%08lX/", deviceID);
+    char fullPath[0x80];
 
-    ok = ok && fileCopy("1:/ro/sys/HWCAL0.dat", "backups/HWCAL0.dat", false, fileCopyBuffer, sz);
-    ok = ok && fileCopy("1:/ro/sys/HWCAL1.dat", "backups/HWCAL1.dat", false, fileCopyBuffer, sz);
+    // Since the other funcs in this file don't create directories recursively (only the last one),
+    // and nor does f_mkdir, create the directories anyway and ignore the result
+    f_mkdir("backups");
+    f_mkdir(pathStart);
 
-    ok = ok && fileCopy("1:/rw/sys/LocalFriendCodeSeed_A", "backups/LocalFriendCodeSeed_A", false, fileCopyBuffer, sz); // often doesn't exist
-    ok = ok && fileCopy("1:/rw/sys/LocalFriendCodeSeed_B", "backups/LocalFriendCodeSeed_B", false, fileCopyBuffer, sz);
+    bool ok = true;
+    sprintf(fullPath, "%sHWCAL0.dat", pathStart);
+    ok = ok && fileCopy("nand:/ro/sys/HWCAL0.dat", fullPath, false, fileCopyBuffer, sz);
+    sprintf(fullPath, "%sHWCAL1.dat", pathStart);
+    ok = ok && fileCopy("nand:/ro/sys/HWCAL1.dat", fullPath, false, fileCopyBuffer, sz);
 
-    ok = ok && fileCopy("1:/rw/sys/SecureInfo_A", "backups/SecureInfo_A", false, fileCopyBuffer, sz);
-    ok = ok && fileCopy("1:/rw/sys/SecureInfo_B", "backups/SecureInfo_B", false, fileCopyBuffer, sz); // often doesn't exist
+    sprintf(fullPath, "%sLocalFriendCodeSeed_A", pathStart);
+    ok = ok && fileCopy("nand:/rw/sys/LocalFriendCodeSeed_A", fullPath, false, fileCopyBuffer, sz); // often doesn't exist
+    sprintf(fullPath, "%sLocalFriendCodeSeed_B", pathStart);
+    ok = ok && fileCopy("nand:/rw/sys/LocalFriendCodeSeed_B", fullPath, false, fileCopyBuffer, sz);
+
+    sprintf(fullPath, "%sSecureInfo_A", pathStart);
+    ok = ok && fileCopy("nand:/rw/sys/SecureInfo_A", fullPath, false, fileCopyBuffer, sz);
+    sprintf(fullPath, "%sSecureInfo_B", pathStart);
+    ok = ok && fileCopy("nand:/rw/sys/SecureInfo_B", fullPath, false, fileCopyBuffer, sz); // often doesn't exist
 
     if (!ok) return false;
 
     alignedseqmemcpy(fileCopyBuffer, (const void *)0x10012000, 0x100);
-    if (getFileSize("backups/otp.bin") != 0x100)
-        ok = ok && fileWrite(fileCopyBuffer, "backups/otp.bin", 0x100);
+    sprintf(fullPath, "%sotp.bin", pathStart);
+    if (getFileSize(fullPath) != 0x100)
+        ok = ok && fileWrite(fileCopyBuffer, fullPath, 0x100);
 
     if (!ok) return false;
 
@@ -435,40 +482,54 @@ static bool backupEssentialFiles(void)
     u8 c = mcuConsoleInfo[0];
     if (c == 2 || c == 4 || (ISN3DS && c == 5) || c == 6)
     {
+        sprintf(fullPath, "%sHWCAL_01_EEPROM.dat", pathStart);
         I2C_readRegBuf(I2C_DEV_EEPROM, 0, fileCopyBuffer, 0x1000); // Up to two instances of hwcal, with the second one @0x800
-        if (getFileSize("backups/HWCAL_01_EEPROM.dat") != 0x1000)
-            ok = ok && fileWrite(fileCopyBuffer, "backups/HWCAL_01_EEPROM.dat", 0x1000);
+        if (getFileSize(fullPath) != 0x1000)
+            ok = ok && fileWrite(fileCopyBuffer, fullPath, 0x1000);
     }
 
     // B9S bootrom backups
     u32 hash[32/4];
     sha(hash, (const void *)0x08080000, 0x10000, SHA_256_MODE);
-    if (memcmp(hash, boot9Sha256, 32) == 0 && getFileSize("backups/boot9.bin") != 0x10000)
-        ok = ok && fileWrite((const void *)0x08080000, "backups/boot9.bin", 0x10000);
+    sprintf(fullPath, "%sboot9.bin", pathStart);
+    if (memcmp(hash, boot9Sha256, 32) == 0 && getFileSize(fullPath) != 0x10000)
+        ok = ok && fileWrite((const void *)0x08080000, fullPath, 0x10000);
     sha(hash, (const void *)0x08090000, 0x10000, SHA_256_MODE);
-    if (memcmp(hash, boot11Sha256, 32) == 0 && getFileSize("backups/boot11.bin") != 0x10000)
-        ok = ok && fileWrite((const void *)0x08090000, "backups/boot11.bin", 0x10000);
+    sprintf(fullPath, "%sboot11.bin", pathStart);
+    if (memcmp(hash, boot11Sha256, 32) == 0 && getFileSize(fullPath) != 0x10000)
+        ok = ok && fileWrite((const void *)0x08090000, fullPath, 0x10000);
 
     return ok;
 }
 
 bool doLumaUpgradeProcess(void)
 {
+    bool ok = true, ok2 = true;
+
     // Ensure CTRNAND is mounted
-    bool ok = mountFs(false, false), ok2 = true;
-    if (!ok)
-        return false;
+    remountCtrNandPartition(false);
+
+    // Users can opt out of all CTRNAND writes done here. The SD card isn't necessarily mounted
+    // when booting from CTRNAND, so ensure it is
+    bool noNandWrites = mountSdCardPartition(false) &&
+        f_stat("sdmc:/luma/.i_am_fine_with_outdated_luma_on_nand", NULL) == FR_OK;
 
     // Try to boot.firm to CTRNAND, when applicable
-    if (isSdMode)
-        ok = fileCopy("0:/boot.firm", "1:/boot.firm", true, fileCopyBuffer, sizeof(fileCopyBuffer));
+#ifndef BUILD_FOR_EXPLOIT_DEV
+    if (!noNandWrites && isSdMode && memcmp(launchedPathForFatfs, "sdmc:", 5) == 0)
+        ok = fileCopy(launchedPathForFatfs, "nand:/boot.firm", true, fileCopyBuffer, sizeof(fileCopyBuffer));
+#endif
 
-    // Try to backup essential files
-    ok2 = backupEssentialFiles();
+    // Try to backup essential files (to the current drive, which is CTRNAND when not in SD mode)
+    if (!noNandWrites || isSdMode)
+        ok2 = backupEssentialFiles();
 
     // Clean up some of the old files
-    fileDelete("0:/luma/config.bin");
-    fileDelete("1:/rw/luma/config.bin");
+    fileDelete("sdmc:/luma/config.bin");
+    if (!noNandWrites) fileDelete("nand:/rw/luma/config.bin");
+
+    createDir("sdmc:/luma/payloads");
+    if (!noNandWrites) createDir("nand:/rw/luma/payloads");
 
     return ok && ok2;
 }

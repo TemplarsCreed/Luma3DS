@@ -32,14 +32,26 @@
 #include "ifile.h"
 #include "menus.h"
 #include "utils.h"
+#include "luma_config.h"
 #include "menus/n3ds.h"
 #include "menus/cheats.h"
 #include "minisoc.h"
+#include "plugin.h"
 #include "menus/screen_filters.h"
+#include "shell.h"
+
+//#define ROSALINA_MENU_SELF_SCREENSHOT 1 // uncomment this to enable the feature
 
 u32 menuCombo = 0;
 bool isHidInitialized = false;
+bool isQtmInitialized = false;
 u32 mcuFwVersion = 0;
+u8 mcuInfoTable[10] = {0};
+bool mcuInfoTableRead = false;
+
+const char *topScreenType = NULL;
+const char *bottomScreenType = NULL;
+bool areScreenTypesInitialized = false;
 
 // libctru redefinition:
 
@@ -51,8 +63,20 @@ bool hidShouldUseIrrst(void)
 
 static inline u32 convertHidKeys(u32 keys)
 {
-    // Nothing to do yet
+    // No actual conversion done
     return keys;
+}
+
+void scanInputHook(void)
+{
+    hidScanInput();
+
+#ifdef ROSALINA_MENU_SELF_SCREENSHOT
+    // Ugly hack but should work. For self-documentation w/o capture card purposes only.
+    u32 selfScreenshotCombo = KEY_L | KEY_DUP | KEY_SELECT;
+    if ((hidKeysHeld() & selfScreenshotCombo) == selfScreenshotCombo && (hidKeysDown() & selfScreenshotCombo) != 0)
+        menuTakeSelfScreenshot();
+#endif
 }
 
 u32 waitInputWithTimeout(s32 msec)
@@ -72,8 +96,35 @@ u32 waitInputWithTimeout(s32 msec)
         }
         n++;
 
-        hidScanInput();
+        scanInputHook();
         keys = convertHidKeys(hidKeysDown()) | (convertHidKeys(hidKeysDownRepeat()) & DIRECTIONAL_KEYS);
+        Draw_Unlock();
+    } while (keys == 0 && !menuShouldExit && isHidInitialized && (msec < 0 || n < msec));
+
+
+    return keys;
+}
+
+u32 waitInputWithTimeoutEx(u32 *outHeldKeys, s32 msec)
+{
+    s32 n = 0;
+    u32 keys;
+
+    do
+    {
+        svcSleepThread(1 * 1000 * 1000LL);
+        Draw_Lock();
+        if (!isHidInitialized || menuShouldExit)
+        {
+            keys = 0;
+            Draw_Unlock();
+            break;
+        }
+        n++;
+
+        scanInputHook();
+        keys = convertHidKeys(hidKeysDown()) | (convertHidKeys(hidKeysDownRepeat()) & DIRECTIONAL_KEYS);
+        *outHeldKeys = convertHidKeys(hidKeysHeld());
         Draw_Unlock();
     } while (keys == 0 && !menuShouldExit && isHidInitialized && (msec < 0 || n < msec));
 
@@ -96,7 +147,7 @@ static u32 scanHeldKeys(void)
         keys = 0;
     else
     {
-        hidScanInput();
+        scanInputHook();
         keys = convertHidKeys(hidKeysHeld());
     }
 
@@ -144,7 +195,8 @@ u32 waitCombo(void)
 }
 
 static MyThread menuThread;
-static u8 ALIGN(8) menuThreadStack[0x3000];
+static u8 CTR_ALIGN(8) menuThreadStack[0x3000];
+static bool menuCloseRequested = false;
 
 static float batteryPercentage;
 static float batteryVoltage;
@@ -158,8 +210,14 @@ static Result menuUpdateMcuInfo(void)
     if (!isServiceUsable("mcu::HWC"))
         return -1;
 
-    res = mcuHwcInit();
+    Handle *mcuHwcHandlePtr = mcuHwcGetSessionHandle();
+    *mcuHwcHandlePtr = 0;
+
+    res = srvGetServiceHandle(mcuHwcHandlePtr, "mcu::HWC");
+    // Try to steal the handle if some other process is using the service (custom SVC)
     if (R_FAILED(res))
+        res = svcControlService(SERVICEOP_STEAL_CLIENT_SESSION, mcuHwcHandlePtr, "mcu::HWC");
+    if (res != 0)
         return res;
 
     // Read single-byte mcu regs 0x0A to 0x0D directly
@@ -190,8 +248,73 @@ static Result menuUpdateMcuInfo(void)
         mcuFwVersion = SYSTEM_VERSION(major - 0x10, minor, 0);
     }
 
-    mcuHwcExit();
+    if (!mcuInfoTableRead)
+        mcuInfoTableRead = R_SUCCEEDED(MCUHWC_ReadRegister(0x7F, mcuInfoTable, sizeof(mcuInfoTable)));
+
+    svcCloseHandle(*mcuHwcHandlePtr);
     return res;
+}
+
+static const char *menuGetScreenTypeStr(u8 vendorId)
+{
+    switch (vendorId)
+    {
+        case 1:  return "IPS"; // SHARP
+        case 12: return "TN";  // JDN
+        default: return "unknown";
+    }
+}
+
+static void menuReadScreenTypes(void)
+{
+    if (areScreenTypesInitialized)
+        return;
+
+    if (!isN3DS)
+    {
+        // Old3DS never have IPS screens and GetVendors is not implemented
+        topScreenType = "TN";
+        bottomScreenType = "TN";
+        areScreenTypesInitialized = true;
+    }
+    else
+    {
+        srvSetBlockingPolicy(false);
+
+        Result res = gspLcdInit();
+        if (R_SUCCEEDED(res))
+        {
+            u8 vendors = 0;
+            if (R_SUCCEEDED(GSPLCD_GetVendors(&vendors)))
+            {
+                topScreenType = menuGetScreenTypeStr(vendors >> 4);
+                bottomScreenType = menuGetScreenTypeStr(vendors & 0xF);
+                areScreenTypesInitialized = true;
+            }
+
+            gspLcdExit();
+        }
+
+        srvSetBlockingPolicy(true);
+    }
+}
+
+static void menuInitializeQtm(void)
+{
+    if (isQtmInitialized)
+        return;
+
+    // Steal QTM handle from GSP, because there is a limit of 3 sessions (or 2 before 9.3) for ALL qtm services
+    Handle qtmHandle = 0;
+    for (int i = 0; i < 30 && !qtmIsInitialized(); i++)
+    {
+        if (R_SUCCEEDED(svcControlService(SERVICEOP_STEAL_CLIENT_SESSION, &qtmHandle, "qtm:sp")))
+            *qtmGetSessionHandle() = qtmHandle;
+        else
+            svcSleepThread(100 * 100 * 1000LL);
+    }
+
+    isQtmInitialized = qtmIsInitialized();
 }
 
 static inline u32 menuAdvanceCursor(u32 pos, u32 numItems, s32 displ)
@@ -223,26 +346,28 @@ MyThread *menuCreateThread(void)
     return &menuThread;
 }
 
+u32 menuCombo;
+u32 g_blockMenuOpen = 0;
+
 void menuThreadMain(void)
 {
-    if(isN3DS)
+    while (!isServiceUsable("ac:u") || !isServiceUsable("hid:USER") || !isServiceUsable("gsp::Gpu") || !isServiceUsable("gsp::Lcd") || !isServiceUsable("cdc:CHK"))
+        svcSleepThread(250 * 1000 * 1000LL);
+
+    if (isN3DS)
+    {
+        while (!isServiceUsable("qtm:u"))
+            svcSleepThread(250 * 1000 * 1000LL);
+        menuInitializeQtm();
         N3DSMenu_UpdateStatus();
+    }
 
-    while (!isServiceUsable("ac:u") || !isServiceUsable("hid:USER"))
-        svcSleepThread(500 * 1000 * 1000LL);
-
-    s64 out;
-    svcGetSystemInfo(&out, 0x10000, 0x102);
-    screenFiltersCurrentTemperature = (int)(u32)out;
-    if (screenFiltersCurrentTemperature < 1000 || screenFiltersCurrentTemperature > 25100)
-        screenFiltersCurrentTemperature = 6500;
-
-    // Careful about race conditions here
-    if (screenFiltersCurrentTemperature != 6500)
-        ScreenFiltersMenu_SetCct(screenFiltersCurrentTemperature);
+    handleShellOpened();
 
     hidInit(); // assume this doesn't fail
     isHidInitialized = true;
+
+    menuReadScreenTypes();
 
     while(!preTerminationRequested)
     {
@@ -252,12 +377,20 @@ void menuThreadMain(void)
 
         Cheat_ApplyCheats();
 
-        if((scanHeldKeys() & menuCombo) == menuCombo)
+        u32 kHeld = scanHeldKeys();
+
+        if(((kHeld & menuCombo) == menuCombo) && !g_blockMenuOpen)
         {
             menuEnter();
             if(isN3DS) N3DSMenu_UpdateStatus();
+            PluginLoader__UpdateMenu();
             menuShow(&rosalinaMenu);
             menuLeave();
+        }
+
+        if (saveSettingsRequest) {
+            LumaConfig_SaveSettings();
+            saveSettingsRequest = false;
         }
     }
 }
@@ -268,6 +401,7 @@ void menuEnter(void)
     Draw_Lock();
     if(!menuShouldExit && menuRefCount == 0)
     {
+        menuCloseRequested = false;
         menuRefCount++;
         svcKernelSetState(0x10000, 2 | 1);
         svcSleepThread(5 * 1000 * 100LL);
@@ -296,6 +430,11 @@ void menuLeave(void)
         svcKernelSetState(0x10000, 2 | 1);
     }
     Draw_Unlock();
+}
+
+void menuRequestClose(void)
+{
+    menuCloseRequested = true;
 }
 
 static void menuDraw(Menu *menu, u32 selected)
@@ -335,27 +474,43 @@ static void menuDraw(Menu *menu, u32 selected)
         dispY += SPACING_Y;
     }
 
+    char topRightStr[CALENDAR_TIME_STR_SIZE] = { 0 };
     if(miniSocEnabled)
     {
-        char ipBuffer[17];
         u32 ip = socGethostid();
         u8 *addr = (u8 *)&ip;
-        int n = sprintf(ipBuffer, "%hhu.%hhu.%hhu.%hhu", addr[0], addr[1], addr[2], addr[3]);
-        Draw_DrawString(SCREEN_BOT_WIDTH - 10 - SPACING_X * n, 10, COLOR_WHITE, ipBuffer);
+        sprintf(topRightStr, "%hhu.%hhu.%hhu.%hhu", addr[0], addr[1], addr[2], addr[3]);
     }
     else
-        Draw_DrawFormattedString(SCREEN_BOT_WIDTH - 10 - SPACING_X * 15, 10, COLOR_WHITE, "%15s", "");
+    {
+        CalendarTime t;
+        calendarTimeFromMsSince1900(&t, osGetTime());
+        calendarTimeToString(topRightStr, &t);
+    }
 
-    if(R_SUCCEEDED(mcuInfoRes))
+    // Also clears what was previously displayed, if it was longer
+    Draw_DrawFormattedString(
+        SCREEN_BOT_WIDTH - 10 - SPACING_X * (CALENDAR_TIME_STR_SIZE - 1), 10, COLOR_WHITE,
+        "%*s", (int)(CALENDAR_TIME_STR_SIZE - 1), topRightStr
+    );
+
+    if(mcuInfoRes == 0)
     {
         u32 voltageInt = (u32)batteryVoltage;
         u32 voltageFrac = (u32)(batteryVoltage * 100.0f) % 100u;
         u32 percentageInt = (u32)batteryPercentage;
         u32 percentageFrac = (u32)(batteryPercentage * 10.0f) % 10u;
 
+        // Temperature is an integer amount of degrees Celsius. 9C/5 has a fractional part in {0, 0.2, ..., 0.8},
+        // so adding 2/5 before truncating rounds to nearest (no ties)
+        bool fahrenheit = (lumaMcuConfig.flags & MCUCFG_FLAG_TEMPERATURE_IN_FAHRENHEIT) != 0;
+        int temperature = fahrenheit ? (9 * batteryTemperature + 2) / 5 + 32 : batteryTemperature;
+
+        // Temperature is padded to 3 chars in both units (F >= 32, so at least 2 digits) so that the string length
+        // doesn't change when the unit is toggled or when going above 99F
         char buf[32];
         int n = sprintf(
-            buf, "   %02hhu\xF8""C  %lu.%02luV  %lu.%lu%%", batteryTemperature, // CP437
+            buf, fahrenheit ? "  %3d\xF8""F  %lu.%02luV  %lu.%lu%%" : "   %02d\xF8""C  %lu.%02luV  %lu.%lu%%", temperature, // CP437
             voltageInt, voltageFrac,
             percentageInt, percentageFrac
         );
@@ -383,6 +538,8 @@ void menuShow(Menu *root)
     u32 numItems = menuCountItems(currentMenu);
     if (menuItemIsHidden(&currentMenu->items[selectedItem]))
         selectedItem = menuAdvanceCursor(selectedItem, numItems, 1);
+
+    menuCloseRequested = false;
 
     Draw_Lock();
     Draw_ClearFramebuffer();
@@ -430,6 +587,9 @@ void menuShow(Menu *root)
                     break;
             }
 
+            if (menuCloseRequested)
+                break;
+
             Draw_Lock();
             Draw_ClearFramebuffer();
             Draw_FlushFramebuffer();
@@ -452,22 +612,17 @@ void menuShow(Menu *root)
             else
                 break;
         }
-        else if(pressed & KEY_DOWN)
+        else if(pressed & (KEY_DOWN | KEY_UP))
         {
-            selectedItem = menuAdvanceCursor(selectedItem, numItems, 1);
-            if (menuItemIsHidden(&currentMenu->items[selectedItem]))
-                selectedItem = menuAdvanceCursor(selectedItem, numItems, 1);
-        }
-        else if(pressed & KEY_UP)
-        {
-            selectedItem = menuAdvanceCursor(selectedItem, numItems, -1);
-            if (menuItemIsHidden(&currentMenu->items[selectedItem]))
-                selectedItem = menuAdvanceCursor(selectedItem, numItems, -1);
+            s32 n = (pressed & KEY_DOWN) != 0 ? 1 : -1;
+            do {
+                selectedItem = menuAdvanceCursor(selectedItem, numItems, n);
+            } while (menuItemIsHidden(&currentMenu->items[selectedItem])); // assume at least one item is visible
         }
 
         Draw_Lock();
         menuDraw(currentMenu, selectedItem);
         Draw_Unlock();
     }
-    while(!menuShouldExit);
+    while(!menuShouldExit && !menuCloseRequested);
 }

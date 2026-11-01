@@ -28,6 +28,7 @@
 #include "synchronization.h"
 #include "svc.h"
 #include "svc/ControlMemory.h"
+#include "svc/CreateThread.h"
 #include "svc/GetHandleInfo.h"
 #include "svc/GetSystemInfo.h"
 #include "svc/GetProcessInfo.h"
@@ -43,8 +44,12 @@
 #include "svc/MapProcessMemoryEx.h"
 #include "svc/UnmapProcessMemoryEx.h"
 #include "svc/ControlService.h"
+#include "svc/ControlProcess.h"
+#include "svc/ExitProcess.h"
+#include "svc/TerminateProcess.h"
 #include "svc/CopyHandle.h"
 #include "svc/TranslateHandle.h"
+#include "svc/ControlMemoryUnsafe.h"
 
 void *officialSVCs[0x7E] = {NULL};
 void *alteredSvcTable[0x100] = {NULL};
@@ -62,7 +67,10 @@ void buildAlteredSvcTable(void)
     memcpy(alteredSvcTable, officialSVCs, 4 * 0x7E);
 
     alteredSvcTable[0x01] = ControlMemoryHookWrapper;
+    alteredSvcTable[0x03] = ExitProcessHookWrapper;
 
+    if (isN3DS)
+        alteredSvcTable[0x08] = CreateThreadHookWrapper;
     alteredSvcTable[0x29] = GetHandleInfoHookWrapper;
     alteredSvcTable[0x2A] = GetSystemInfoHookWrapper;
     alteredSvcTable[0x2B] = GetProcessInfoHookWrapper;
@@ -74,6 +82,8 @@ void buildAlteredSvcTable(void)
 
     alteredSvcTable[0x59] = SetGpuProt;
     alteredSvcTable[0x5A] = SetWifiEnabled;
+
+    alteredSvcTable[0x76] = TerminateProcessHook;
 
     alteredSvcTable[0x7B] = Backdoor;
     alteredSvcTable[0x7C] = KernelSetStateHook;
@@ -87,13 +97,15 @@ void buildAlteredSvcTable(void)
     alteredSvcTable[0x93] = invalidateInstructionCacheRange;
     alteredSvcTable[0x94] = invalidateEntireInstructionCache;
 
-    alteredSvcTable[0xA0] = MapProcessMemoryEx;
+    alteredSvcTable[0xA0] = MapProcessMemoryExWrapper;
     alteredSvcTable[0xA1] = UnmapProcessMemoryEx;
     alteredSvcTable[0xA2] = ControlMemoryEx;
+    alteredSvcTable[0xA3] = ControlMemoryUnsafeWrapper;
 
     alteredSvcTable[0xB0] = ControlService;
     alteredSvcTable[0xB1] = CopyHandleWrapper;
     alteredSvcTable[0xB2] = TranslateHandleWrapper;
+    alteredSvcTable[0xB3] = ControlProcess;
 }
 
 void signalSvcEntry(u32 svcId)
@@ -108,10 +120,18 @@ void signalSvcEntry(u32 svcId)
 void signalSvcReturn(u32 svcId)
 {
     KProcess *currentProcess = currentCoreContext->objectContext.currentProcess;
+    u32      flags = KPROCESS_GET_RVALUE(currentProcess, customFlags);
 
     // Since DBGEVENT_SYSCALL_RETURN is non blocking, we'll cheat using EXCEVENT_UNDEFINED_SYSCALL (debug->svcId is fortunately an u16!)
-    if(debugOfProcess(currentProcess) != NULL && svcId != 0xFF && shouldSignalSyscallDebugEvent(currentProcess, svcId))
+    if((svcSignalingEnabled & 1) != 0 && (currentProcess) != NULL && svcId != 0xFF && shouldSignalSyscallDebugEvent(currentProcess, svcId))
         SignalDebugEvent(DBGEVENT_OUTPUT_STRING, 0xFFFFFFFF, svcId);
+
+    if (flags & SignalOnMemLayoutChanges && flags & MemLayoutChanged)
+    {
+        *KPROCESS_GET_PTR(currentProcess, customFlags) = flags & ~MemLayoutChanged;
+        SignalEvent(KPROCESS_GET_RVALUE(currentProcess, onMemoryLayoutChangeEvent));
+        svcSignalingEnabled &= ~2;
+    }
 }
 
 void postprocessSvc(void)

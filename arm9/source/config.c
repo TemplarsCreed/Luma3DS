@@ -24,7 +24,10 @@
 *         reasonable ways as different from the original version.
 */
 
+#define _GNU_SOURCE // for strchrnul
+
 #include <assert.h>
+#include <stddef.h>
 #include <strings.h>
 #include "config.h"
 #include "memory.h"
@@ -37,32 +40,38 @@
 #include "pin.h"
 #include "i2c.h"
 #include "ini.h"
+#include "firm.h"
 
 #include "config_template_ini.h" // note that it has an extra NUL byte inserted
 
 #define MAKE_LUMA_VERSION_MCU(major, minor, build) (u16)(((major) & 0xFF) << 8 | ((minor) & 0x1F) << 5 | ((build) & 7))
+
+#define FLOAT_CONV_MULT 100000000ll
+#define FLOAT_CONV_PRECISION 8u
 
 CfgData configData;
 ConfigurationStatus needConfig;
 static CfgData oldConfig;
 
 static CfgDataMcu configDataMcu;
-static_assert(sizeof(CfgDataMcu) > 0, "wrong data size");
+// Must not overlap with other data stored in the 200-byte MCU free register area (e.g. at offset 188, u32)
+static_assert(sizeof(CfgDataMcu) == 8, "wrong data size");
 
 // INI parsing
 // ===========================================================
 
 static const char *singleOptionIniNamesBoot[] = {
     "autoboot_emunand",
-    "use_emunand_firm_if_r_pressed",
     "enable_external_firm_and_modules",
     "enable_game_patching",
+    "app_syscore_threads_on_core_2",
     "show_system_settings_string",
     "show_gba_boot_screen",
 };
 
 static const char *singleOptionIniNamesMisc[] = {
     "use_dev_unitinfo",
+    "enable_dsi_external_filter",
     "disable_arm11_exception_handlers",
     "enable_safe_firm_rosalina",
 };
@@ -95,10 +104,9 @@ static int parseBoolOption(bool *out, const char *val)
     }
 }
 
-static int parseDecIntOption(s64 *out, const char *val, s64 minval, s64 maxval)
+static int parseDecIntOptionImpl(s64 *out, const char *val, size_t numDigits, s64 minval, s64 maxval)
 {
     *out = 0;
-    size_t numDigits = strlen(val);
     s64 res = 0;
     size_t i = 0;
 
@@ -123,6 +131,87 @@ static int parseDecIntOption(s64 *out, const char *val, s64 minval, s64 maxval)
 
     res *= sign;
     if (res <= maxval && res >= minval) {
+        *out = res;
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
+static int parseDecIntOption(s64 *out, const char *val, s64 minval, s64 maxval)
+{
+    return parseDecIntOptionImpl(out, val, strlen(val), minval, maxval);
+}
+
+static int parseDecFloatOption(s64 *out, const char *val, s64 minval, s64 maxval)
+{
+    s64 sign = 1;// intPart < 0 ? -1 : 1;
+
+    switch (val[0]) {
+        case '\0':
+            return -1;
+        case '+':
+            ++val;
+            break;
+        case '-':
+            sign = -1;
+            ++val;
+            break;
+        default:
+            break;
+    }
+
+    // Reject "-" and "+"
+    if (val[0] == '\0') {
+        return -1;
+    }
+
+    char *point = strchrnul(val, '.');
+
+    // Parse integer part, then fractional part
+    s64 intPart = 0;
+    s64 fracPart = 0;
+    int rc = 0;
+
+    if (point == val) {
+        // e.g. -.5
+        if (val[1] == '\0')
+            return -1;
+    }
+    else {
+        rc = parseDecIntOptionImpl(&intPart, val, point - val, INT64_MIN, INT64_MAX);
+    }
+
+    if (rc != 0) {
+        return -1;
+    }
+
+    s64 intPartAbs = sign == -1 ? -intPart : intPart;
+    s64 res = 0;
+    bool of = __builtin_mul_overflow(intPartAbs, FLOAT_CONV_MULT, &res);
+
+    if (of) {
+        return -1;
+    }
+
+    s64 mul = FLOAT_CONV_MULT / 10;
+
+    // Check if there's a fractional part
+    if (point[0] != '\0' && point[1] != '\0') {
+        for (char *pos = point + 1; *pos != '\0' && mul > 0; pos++) {
+            if (*pos < '0' || *pos > '9') {
+                return -1;
+            }
+
+            res += (*pos - '0') * mul;
+            mul /= 10;
+        }
+    }
+
+
+    res = sign * (res + fracPart);
+
+    if (res <= maxval && res >= minval && !of) {
         *out = res;
         return 0;
     } else {
@@ -222,6 +311,50 @@ static void menuComboToString(char *out, u32 combo)
         out[-1] = 0;
 }
 
+static int encodedFloatToString(char *out, s64 val)
+{
+    s64 sign = val >= 0 ? 1 : -1;
+
+    s64 intPart = (sign * val) / FLOAT_CONV_MULT;
+    s64 fracPart = (sign * val) % FLOAT_CONV_MULT;
+
+    while (fracPart % 10 != 0) {
+        // Remove trailing zeroes
+        fracPart /= 10;
+    }
+
+    int n = sprintf(out, "%lld", sign * intPart);
+    if (fracPart != 0) {
+        n += sprintf(out + n, ".%0*lld", (int)FLOAT_CONV_PRECISION, fracPart);
+
+        // Remove trailing zeroes
+        int n2 = n - 1;
+        while (out[n2] == '0') {
+            out[n2--] = '\0';
+        }
+
+        n = n2;
+    }
+
+    return n;
+}
+
+// e.g. "screen_filters_top_gamma_g" with prefix "screen_filters_top_gamma_" -> 1
+static int getScreenFilterChannelFromOptionName(const char *name, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n) != 0 || name[n] == '\0' || name[n + 1] != '\0') {
+        return -1;
+    }
+
+    switch (name[n]) {
+        case 'r': return 0;
+        case 'g': return 1;
+        case 'b': return 2;
+        default: return -1;
+    }
+}
+
 static bool hasIniParseError = false;
 static int iniParseErrorLine = 0;
 
@@ -319,8 +452,22 @@ static int configIniHandler(void* user, const char* section, const char* name, c
             } else {
                 CHECK_PARSE_OPTION(-1);
             }
+        } else if (strcmp(name, "autoboot_mode") == 0) {
+            if (strcasecmp(value, "off") == 0) {
+                cfg->multiConfig |= 0 << (2 * (u32)AUTOBOOTMODE);
+                return 1;
+            } else if (strcasecmp(value, "3ds") == 0) {
+                cfg->multiConfig |= 1 << (2 * (u32)AUTOBOOTMODE);
+                return 1;
+            } else if (strcasecmp(value, "dsi") == 0) {
+                cfg->multiConfig |= 2 << (2 * (u32)AUTOBOOTMODE);
+                return 1;
+            } else {
+                CHECK_PARSE_OPTION(-1);
+            }
+        } else {
+            CHECK_PARSE_OPTION(-1);
         }
-        CHECK_PARSE_OPTION(-1);
     } else if (strcmp(section, "rosalina") == 0) {
         // Rosalina options
         if (strcmp(name, "hbldr_3dsx_titleid") == 0) {
@@ -333,18 +480,81 @@ static int configIniHandler(void* user, const char* section, const char* name, c
             CHECK_PARSE_OPTION(parseKeyComboOption(&opt, value));
             cfg->rosalinaMenuCombo = opt;
             return 1;
-        } else if (strcmp(name, "screen_filters_cct") == 0) {
-            s64 opt;
-            CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, 1000, 25100));
-            cfg->screenFiltersCct = (u32)opt;
+        } else if (strcmp(name, "plugin_loader_enabled") == 0) {
+            bool opt;
+            CHECK_PARSE_OPTION(parseBoolOption(&opt, value));
+            cfg->pluginLoaderFlags = opt ? cfg->pluginLoaderFlags | 1 : cfg->pluginLoaderFlags & ~1;
             return 1;
         } else if (strcmp(name, "ntp_tz_offset_min") == 0) {
             s64 opt;
             CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, -779, 899));
             cfg->ntpTzOffetMinutes = (s16)opt;
             return 1;
+        } else {
+            CHECK_PARSE_OPTION(-1);
         }
-        else {
+    } else if (strcmp(section, "screen_filters") == 0) {
+        int ch;
+        if (strcmp(name, "screen_filters_top_cct") == 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, 1000, 25100));
+            cfg->topScreenFilter.cct = (u32)opt;
+            return 1;
+        } else if ((ch = getScreenFilterChannelFromOptionName(name, "screen_filters_top_gamma_")) >= 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecFloatOption(&opt, value, 0, 4 * FLOAT_CONV_MULT));
+            cfg->topScreenFilter.gammaEnc[ch] = opt;
+            return 1;
+        } else if ((ch = getScreenFilterChannelFromOptionName(name, "screen_filters_top_contrast_")) >= 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecFloatOption(&opt, value, 0, 8 * FLOAT_CONV_MULT));
+            cfg->topScreenFilter.contrastEnc[ch] = opt;
+            return 1;
+        } else if (strcmp(name, "screen_filters_top_invert") == 0) {
+            bool opt;
+            CHECK_PARSE_OPTION(parseBoolOption(&opt, value));
+            cfg->topScreenFilter.invert = opt;
+            return 1;
+        } else if (strcmp(name, "screen_filters_bot_cct") == 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, 1000, 25100));
+            cfg->bottomScreenFilter.cct = (u32)opt;
+            return 1;
+        } else if ((ch = getScreenFilterChannelFromOptionName(name, "screen_filters_bot_gamma_")) >= 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecFloatOption(&opt, value, 0, 4 * FLOAT_CONV_MULT));
+            cfg->bottomScreenFilter.gammaEnc[ch] = opt;
+            return 1;
+        } else if ((ch = getScreenFilterChannelFromOptionName(name, "screen_filters_bot_contrast_")) >= 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecFloatOption(&opt, value, 0, 8 * FLOAT_CONV_MULT));
+            cfg->bottomScreenFilter.contrastEnc[ch] = opt;
+            return 1;
+        } else if (strcmp(name, "screen_filters_bot_invert") == 0) {
+            bool opt;
+            CHECK_PARSE_OPTION(parseBoolOption(&opt, value));
+            cfg->bottomScreenFilter.invert = opt;
+            return 1;
+        } else {
+            CHECK_PARSE_OPTION(-1);
+        }
+    } else if (strcmp(section, "autoboot") == 0) {
+        if (strcmp(name, "autoboot_dsi_titleid") == 0) {
+            u64 opt;
+            CHECK_PARSE_OPTION(parseHexIntOption(&opt, value, 0, 0xFFFFFFFFFFFFFFFFull));
+            cfg->autobootTwlTitleId = opt;
+            return 1;
+        } else if (strcmp(name, "autoboot_3ds_app_mem_type") == 0) {
+            s64 opt;
+            CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, 0, 4));
+            cfg->autobootCtrAppmemtype = (u8)opt;
+            return 1;
+        } else if (strcmp(name, "autoboot_3ds_use_ns") == 0) {
+            bool opt;
+            CHECK_PARSE_OPTION(parseBoolOption(&opt, value));
+            cfg->autobootCtrUseNs = opt;
+            return 1;
+        } else {
             CHECK_PARSE_OPTION(-1);
         }
     } else if (strcmp(section, "misc") == 0) {
@@ -356,6 +566,7 @@ static int configIniHandler(void* user, const char* section, const char* name, c
                 return 1;
             }
         }
+
         CHECK_PARSE_OPTION(-1);
     } else {
         CHECK_PARSE_OPTION(-1);
@@ -372,6 +583,7 @@ static size_t saveLumaIniConfigToStr(char *out)
 
     const char *splashPosStr;
     const char *n3dsCpuStr;
+    const char *autobootModeStr;
 
     switch (MULTICONFIG(SPLASH)) {
         default: case 0: splashPosStr = "off"; break;
@@ -384,6 +596,12 @@ static size_t saveLumaIniConfigToStr(char *out)
         case 1: n3dsCpuStr = "clock"; break;
         case 2: n3dsCpuStr = "l2"; break;
         case 3: n3dsCpuStr = "clock+l2"; break;
+    }
+
+    switch (MULTICONFIG(AUTOBOOTMODE)) {
+        default: case 0: autobootModeStr = "off"; break;
+        case 1: autobootModeStr = "3ds"; break;
+        case 2: autobootModeStr = "dsi"; break;
     }
 
     if (VERSION_BUILD != 0) {
@@ -403,30 +621,51 @@ static size_t saveLumaIniConfigToStr(char *out)
     static const int pinOptionToDigits[] = { 0, 4, 6, 8 };
     int pinNumDigits = pinOptionToDigits[MULTICONFIG(PIN)];
 
+    char topScreenFilterGammaStrs[3][32];
+    char topScreenFilterContrastStrs[3][32];
+    char bottomScreenFilterGammaStrs[3][32];
+    char bottomScreenFilterContrastStrs[3][32];
+    for (u32 ch = 0; ch < 3; ch++) {
+        encodedFloatToString(topScreenFilterGammaStrs[ch], cfg->topScreenFilter.gammaEnc[ch]);
+        encodedFloatToString(topScreenFilterContrastStrs[ch], cfg->topScreenFilter.contrastEnc[ch]);
+        encodedFloatToString(bottomScreenFilterGammaStrs[ch], cfg->bottomScreenFilter.gammaEnc[ch]);
+        encodedFloatToString(bottomScreenFilterContrastStrs[ch], cfg->bottomScreenFilter.contrastEnc[ch]);
+    }
+
     int n = sprintf(
         out, (const char *)config_template_ini,
         lumaVerStr, lumaRevSuffixStr,
 
         (int)CONFIG_VERSIONMAJOR, (int)CONFIG_VERSIONMINOR,
-        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(USEEMUFIRM),
-        (int)CONFIG(LOADEXTFIRMSANDMODULES), (int)CONFIG(PATCHGAMES),
+        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(LOADEXTFIRMSANDMODULES),
+        (int)CONFIG(PATCHGAMES), (int)CONFIG(REDIRECTAPPTHREADS),
         (int)CONFIG(PATCHVERSTRING), (int)CONFIG(SHOWGBABOOT),
 
         1 + (int)MULTICONFIG(DEFAULTEMU), 4 - (int)MULTICONFIG(BRIGHTNESS),
         splashPosStr, (unsigned int)cfg->splashDurationMsec,
         pinNumDigits, n3dsCpuStr,
+        autobootModeStr,
 
-        cfg->hbldr3dsxTitleId, rosalinaMenuComboStr,
-        (int)cfg->screenFiltersCct, (int)cfg->ntpTzOffetMinutes,
+        cfg->hbldr3dsxTitleId, rosalinaMenuComboStr, (int)(cfg->pluginLoaderFlags & 1),
+        (int)cfg->ntpTzOffetMinutes,
 
-        (int)CONFIG(PATCHUNITINFO), (int)CONFIG(DISABLEARM11EXCHANDLERS),
-        (int)CONFIG(ENABLESAFEFIRMROSALINA)
+        (int)cfg->topScreenFilter.cct, (int)cfg->bottomScreenFilter.cct,
+        topScreenFilterGammaStrs[0], topScreenFilterGammaStrs[1], topScreenFilterGammaStrs[2],
+        bottomScreenFilterGammaStrs[0], bottomScreenFilterGammaStrs[1], bottomScreenFilterGammaStrs[2],
+        topScreenFilterContrastStrs[0], topScreenFilterContrastStrs[1], topScreenFilterContrastStrs[2],
+        bottomScreenFilterContrastStrs[0], bottomScreenFilterContrastStrs[1], bottomScreenFilterContrastStrs[2],
+        (int)cfg->topScreenFilter.invert, (int)cfg->bottomScreenFilter.invert,
+
+        cfg->autobootTwlTitleId, (int)cfg->autobootCtrAppmemtype, (int)cfg->autobootCtrUseNs,
+
+        (int)CONFIG(PATCHUNITINFO), (int)CONFIG(ENABLEDSIEXTFILTER),
+        (int)CONFIG(DISABLEARM11EXCHANDLERS), (int)CONFIG(ENABLESAFEFIRMROSALINA)
     );
 
     return n < 0 ? 0 : (size_t)n;
 }
 
-static char tmpIniBuffer[0x2000];
+static char tmpIniBuffer[0x2000 + 0x400]; // eyeballed. TODO use #embed
 
 static bool readLumaIniConfig(void)
 {
@@ -441,10 +680,33 @@ static bool readLumaIniConfig(void)
 static bool writeLumaIniConfig(void)
 {
     size_t n = saveLumaIniConfigToStr(tmpIniBuffer);
+
+    // FIXME: this is UB we should port snprintf sometime (as well as fix other tech debt)
+    if (n + 1 >= sizeof(tmpIniBuffer)) {
+        error("Configuration data buffer overflow, please report this issue");
+        __builtin_unreachable();
+    }
+
     return n != 0 && fileWrite(tmpIniBuffer, "config.ini", n);
 }
 
 // ===========================================================
+
+static u8 computeConfigMcuChecksum(const u8 *data)
+{
+    // Only the fields from lumaVersion onwards are checksummed
+    u8 checksum = 0;
+    for (u32 i = offsetof(CfgDataMcu, lumaVersion); i < sizeof(CfgDataMcu) - 1; i++)
+        checksum += data[i];
+    return ~checksum;
+}
+
+static void resetConfigMcu(void)
+{
+    memset(&configDataMcu, 0, sizeof(CfgDataMcu));
+    configDataMcu.volumeSliderOverride = MCUCFG_UNSET_PERCENTAGE_OVERRIDE;
+    configDataMcu.ledMasterBrightnessOverride = MCUCFG_UNSET_PERCENTAGE_OVERRIDE;
+}
 
 static void writeConfigMcu(void)
 {
@@ -459,10 +721,7 @@ static void writeConfigMcu(void)
     memcpy(data, &configDataMcu, sizeof(CfgDataMcu));
 
     // Fix checksum
-    u8 checksum = 0;
-    for (u32 i = 0; i < sizeof(CfgDataMcu) - 1; i++)
-        checksum += data[i];
-    checksum = ~checksum;
+    u8 checksum = computeConfigMcuChecksum(data);
     data[sizeof(CfgDataMcu) - 1] = checksum;
     configDataMcu.checksum = checksum;
 
@@ -480,15 +739,15 @@ static bool readConfigMcu(void)
     I2C_readRegBuf(I2C_DEV_MCU, 0x61, data, sizeof(CfgDataMcu));
     memcpy(&configDataMcu, data, sizeof(CfgDataMcu));
 
-    u8 checksum = 0;
-    for (u32 i = 0; i < sizeof(CfgDataMcu) - 1; i++)
-        checksum += data[i];
-    checksum = ~checksum;
+    u8 checksum = computeConfigMcuChecksum(data);
 
+    // Note: data written with the previous 6-byte layout (lumaVersion, bootCfg, reserved[2], checksum)
+    // is always rejected here, as lumaVersion now overlaps with the old bootCfg and reserved[0] fields
+    // (thus is < 0x100)
     if (checksum != configDataMcu.checksum || configDataMcu.lumaVersion < MAKE_LUMA_VERSION_MCU(10, 3, 0))
     {
         // Invalid data stored in MCU...
-        memset(&configDataMcu, 0, sizeof(CfgDataMcu));
+        resetConfigMcu();
         configData.bootConfig = 0;
         // Perform upgrade process (ignoring failures)
         doLumaUpgradeProcess();
@@ -496,6 +755,12 @@ static bool readConfigMcu(void)
 
         return false;
     }
+
+    // Sanitize non-checksummed fields
+    if ((configDataMcu.flags & MCUCFG_FLAGS_AUDIO_ROUTING_MASK) == MCUCFG_FLAGS_AUDIO_ROUTING_MASK)
+        configDataMcu.flags &= ~MCUCFG_FLAGS_AUDIO_ROUTING_MASK;
+    if (configDataMcu.volumeSliderOverrideStereoBalance < -100 || configDataMcu.volumeSliderOverrideStereoBalance > 100)
+        configDataMcu.volumeSliderOverrideStereoBalance = 0;
 
     if (configDataMcu.lumaVersion < curVer)
     {
@@ -507,11 +772,28 @@ static bool readConfigMcu(void)
     return true;
 }
 
+static void applyLedMasterBrightnessOverride(void)
+{
+    // We deliberately leave the POWER LED setting as "auto" instead of "off" so that the red POWER LED appears
+    // regardless of setting. Note that the red POWER LED is not dimmable.
+
+    u8 override = configDataMcu.ledMasterBrightnessOverride;
+    u8 pct = override & 0x7F;
+
+    // Only touch the MCU if the override is enabled, set, and not the default (100%)
+    if ((override & 0x80) != 0 || pct >= 100)
+        return;
+
+    // Round to nearest integer, same as Rosalina
+    I2C_writeReg(I2C_DEV_MCU, 0x28, (255 * pct + 50) / 100);
+}
+
 bool readConfig(void)
 {
     bool retMcu, ret;
 
     retMcu = readConfigMcu();
+    applyLedMasterBrightnessOverride();
     ret = readLumaIniConfig();
     if(!retMcu || !ret ||
        configData.formatVersionMajor != CONFIG_VERSIONMAJOR ||
@@ -522,15 +804,25 @@ bool readConfig(void)
         configData.formatVersionMinor = CONFIG_VERSIONMINOR;
         configData.config |= 1u << PATCHVERSTRING;
         configData.splashDurationMsec = 3000;
-        configData.hbldr3dsxTitleId = 0x000400000D921E00ull;
+        configData.hbldr3dsxTitleId = HBLDR_DEFAULT_3DSX_TID;
         configData.rosalinaMenuCombo = 1u << 9 | 1u << 7 | 1u << 2; // L+Start+Select
-        configData.screenFiltersCct = 6500; // default temp, no-op
+        configData.topScreenFilter.cct = 6500; // default temp, no-op
+        for (u32 ch = 0; ch < 3; ch++) {
+            configData.topScreenFilter.gammaEnc[ch] = 1 * FLOAT_CONV_MULT; // 1.0f
+            configData.topScreenFilter.contrastEnc[ch] = 1 * FLOAT_CONV_MULT; // 1.0f
+        }
+        configData.bottomScreenFilter = configData.topScreenFilter;
+        configData.autobootTwlTitleId = AUTOBOOT_DEFAULT_TWL_TID;
         ret = false;
     }
     else
         ret = true;
 
     configData.bootConfig = configDataMcu.bootCfg;
+    configData.mcuConfigFlags = configDataMcu.flags;
+    configData.volumeSliderOverride = configDataMcu.volumeSliderOverride;
+    configData.volumeSliderOverrideStereoBalance = configDataMcu.volumeSliderOverrideStereoBalance;
+    configData.ledMasterBrightnessOverride = configDataMcu.ledMasterBrightnessOverride;
     oldConfig = configData;
 
     return ret;
@@ -566,19 +858,25 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                "Splash: Off( ) Before( ) After( ) payloads",
                                                "PIN lock: Off( ) 4( ) 6( ) 8( ) digits",
                                                "New 3DS CPU: Off( ) Clock( ) L2( ) Clock+L2( )",
+                                               "Hbmenu autoboot: Off( ) 3DS( ) DSi( )",
                                              };
 
     static const char *singleOptionsText[] = { "( ) Autoboot EmuNAND",
-                                               "( ) Use EmuNAND FIRM if booting with R",
                                                "( ) Enable loading external FIRMs and modules",
                                                "( ) Enable game patching",
+                                               "( ) Redirect app. syscore threads to core2",
                                                "( ) Show NAND or user string in System Settings",
                                                "( ) Show GBA boot screen in patched AGB_FIRM",
+
+                                               // Should always be the last 2 entries
+                                               "\nBoot chainloader",
+                                               "Save and exit"
                                              };
 
     static const char *optionsDescription[]  = { "Select the default EmuNAND.\n\n"
-                                                 "It will be booted when no\n"
-                                                 "directional pad buttons are pressed.",
+                                                 "It will be booted when no directional\n"
+                                                 "pad buttons are pressed (Up/Right/Down\n"
+                                                 "/Left equal EmuNANDs 1/2/3/4).",
 
                                                  "Select the screen brightness.",
 
@@ -607,6 +905,14 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                  "'Clock+L2' can cause issues with some\n"
                                                  "games.",
 
+                                                 "Enable autobooting into homebrew menu,\n"
+                                                 "either into 3DS or DSi mode.\n\n"
+                                                 "Autobooting into a gamecard title is\n"
+                                                 "not supported.\n\n"
+                                                 "Refer to the \"autoboot\" section in the\n"
+                                                 "configuration file to configure\n"
+                                                 "this feature.",
+
                                                  "If enabled, an EmuNAND\n"
                                                  "will be launched on boot.\n\n"
                                                  "Otherwise, SysNAND will.\n\n"
@@ -615,17 +921,6 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                  "default, hold a directional pad button\n"
                                                  "(Up/Right/Down/Left equal EmuNANDs\n"
                                                  "1/2/3/4).",
-
-                                                 "If enabled, when holding R on boot\n"
-                                                 "SysNAND will be booted with an\n"
-                                                 "EmuNAND FIRM.\n\n"
-                                                 "Otherwise, an EmuNAND will be booted\n"
-                                                 "with the SysNAND FIRM.\n\n"
-                                                 "To use a different EmuNAND from the\n"
-                                                 "default, hold a directional pad button\n"
-                                                 "(Up/Right/Down/Left equal EmuNANDs\n"
-                                                 "1/2/3/4), also add A if you have\n"
-                                                 "a matching payload.",
 
                                                  "Enable loading external FIRMs and\n"
                                                  "system modules.\n\n"
@@ -637,31 +932,45 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                  "of patched code binaries, exHeaders,\n"
                                                  "IPS code patches and LayeredFS\n"
                                                  "for specific games.\n\n"
-                                                 "Also makes certain DLCs\n"
-                                                 "for out-of-region games work.\n\n"
+                                                 "Also makes certain DLCs for out-of-\n"
+                                                 "region games work.\n\n"
                                                  "Refer to the wiki for instructions.",
 
-                                                 "Enable showing the current NAND/FIRM:\n\n"
+                                                 "Redirect app. threads that would spawn\n"
+                                                 "on core1, to core2 (which is an extra\n"
+                                                 "CPU core for applications that usually\n"
+                                                 "remains unused).\n\n"
+                                                 "This improves the performance of very\n"
+                                                 "demanding games (like Pok\x82mon US/UM)\n" // CP437
+                                                 "by about 10%. Can break some games\n"
+                                                 "and other applications.\n",
+
+                                                 "Enable showing the current NAND:\n\n"
                                                  "\t* Sys  = SysNAND\n"
                                                  "\t* Emu  = EmuNAND 1\n"
-                                                 "\t* EmuX = EmuNAND X\n"
-                                                 "\t* SysE = SysNAND with EmuNAND 1 FIRM\n"
-                                                 "\t* SyEX = SysNAND with EmuNAND X FIRM\n"
-                                                 "\t* EmuS = EmuNAND 1 with SysNAND FIRM\n"
-                                                 "\t* EmXS = EmuNAND X with SysNAND FIRM\n\n"
+                                                 "\t* EmuX = EmuNAND X\n\n"
                                                  "or a user-defined custom string in\n"
                                                  "System Settings.\n\n"
                                                  "Refer to the wiki for instructions.",
 
                                                  "Enable showing the GBA boot screen\n"
                                                  "when booting GBA games.",
+
+                                                // Should always be the last 2 entries
+                                                "Boot to the Luma3DS chainloader menu.",
+
+                                                 "Save the changes and exit. To discard\n"
+                                                 "any changes press the POWER button.\n"
+                                                 "Use START as a shortcut to this entry."
                                                };
 
     FirmwareSource nandType = FIRMWARE_SYSNAND;
     if(isSdMode)
     {
+        // Check if there is at least one emuNAND
+        u32 emuIndex = 0;
         nandType = FIRMWARE_EMUNAND;
-        locateEmuNand(&nandType);
+        locateEmuNand(&nandType, &emuIndex, false);
     }
 
     struct multiOption {
@@ -675,6 +984,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
         { .visible = true },
         { .visible = true },
         { .visible = ISN3DS },
+        { .visible = true },
     };
 
     struct singleOption {
@@ -683,7 +993,9 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
         bool visible;
     } singleOptions[] = {
         { .visible = nandType == FIRMWARE_EMUNAND },
-        { .visible = nandType == FIRMWARE_EMUNAND },
+        { .visible = true },
+        { .visible = true },
+        { .visible = ISN3DS },
         { .visible = true },
         { .visible = true },
         { .visible = true },
@@ -720,7 +1032,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                        "FIRM1" };
 
     drawString(true, 10, 10, COLOR_TITLE, CONFIG_TITLE);
-    drawString(true, 10, 10 + SPACING_Y, COLOR_TITLE, "Press A to select, START to save");
+    drawString(true, 10, 10 + SPACING_Y, COLOR_TITLE, "Use the DPAD and A to change settings");
     drawFormattedString(false, 10, SCREEN_HEIGHT - 2 * SPACING_Y, COLOR_YELLOW, "Booted from %s via %s", isSdMode ? "SD" : "CTRNAND", bootTypes[(u32)bootType]);
 
     //Character to display a selected option
@@ -747,7 +1059,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
 
         singleOptions[i].posY = endPos + SPACING_Y;
         endPos = drawString(true, 10, singleOptions[i].posY, color, singleOptionsText[i]);
-        if(singleOptions[i].enabled) drawCharacter(true, 10 + SPACING_X, singleOptions[i].posY, color, selected);
+        if(singleOptions[i].enabled && singleOptionsText[i][0] == '(') drawCharacter(true, 10 + SPACING_X, singleOptions[i].posY, color, selected);
 
         if(color == COLOR_RED)
         {
@@ -759,26 +1071,34 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
 
     drawString(false, 10, 10, COLOR_WHITE, optionsDescription[selectedOption]);
 
+    bool startPressed = false;
     //Boring configuration menu
     while(true)
     {
-        u32 pressed;
+        u32 pressed = 0;
+        if (!startPressed)
         do
         {
             pressed = waitInput(true) & MENU_BUTTONS;
         }
         while(!pressed);
 
-        if(pressed == BUTTON_START) break;
+        // Force the selection of "save and exit" and trigger it.
+        if(pressed & BUTTON_START)
+        {
+            startPressed = true;
+            // This moves the cursor to the last entry
+            pressed = BUTTON_RIGHT;
+        }
 
-        if(pressed != BUTTON_A)
+        if(pressed & DPAD_BUTTONS)
         {
             //Remember the previously selected option
             u32 oldSelectedOption = selectedOption;
 
             while(true)
             {
-                switch(pressed)
+                switch(pressed & DPAD_BUTTONS)
                 {
                     case BUTTON_UP:
                         selectedOption = !selectedOption ? totalIndexes : selectedOption - 1;
@@ -816,7 +1136,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                 }
             }
 
-            if(selectedOption == oldSelectedOption) continue;
+            if(selectedOption == oldSelectedOption && !startPressed) continue;
 
             //The user moved to a different option, print the old option in white and the new one in red. Only print 'x's if necessary
             if(oldSelectedOption < multiOptionsAmount)
@@ -837,7 +1157,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
             drawString(false, 10, 10, COLOR_BLACK, optionsDescription[oldSelectedOption]);
             drawString(false, 10, 10, COLOR_WHITE, optionsDescription[selectedOption]);
         }
-        else
+        else if (pressed & BUTTON_A || startPressed)
         {
             //The selected option's status changed, print the 'x's accordingly
             if(isMultiOption)
@@ -850,15 +1170,29 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
             }
             else
             {
-                bool oldEnabled = singleOptions[singleSelected].enabled;
-                singleOptions[singleSelected].enabled = !oldEnabled;
-                if(oldEnabled) drawCharacter(true, 10 + SPACING_X, singleOptions[singleSelected].posY, COLOR_BLACK, selected);
+                // Save and exit was selected.
+                if (singleSelected == singleOptionsAmount - 1)
+                {
+                    drawString(true, 10, singleOptions[singleSelected].posY, COLOR_GREEN, singleOptionsText[singleSelected]);
+                    startPressed = false;
+                    break;
+                }
+                else if (singleSelected == singleOptionsAmount - 2) {
+                    loadHomebrewFirm(0);
+                    break;
+                }
+                else
+                {
+                    bool oldEnabled = singleOptions[singleSelected].enabled;
+                    singleOptions[singleSelected].enabled = !oldEnabled;
+                    if(oldEnabled) drawCharacter(true, 10 + SPACING_X, singleOptions[singleSelected].posY, COLOR_BLACK, selected);
+                }
             }
         }
 
         //In any case, if the current option is enabled (or a multiple choice option is selected) we must display a red 'x'
         if(isMultiOption) drawCharacter(true, 10 + multiOptions[selectedOption].posXs[multiOptions[selectedOption].enabled] * SPACING_X, multiOptions[selectedOption].posY, COLOR_RED, selected);
-        else if(singleOptions[singleSelected].enabled) drawCharacter(true, 10 + SPACING_X, singleOptions[singleSelected].posY, COLOR_RED, selected);
+        else if(singleOptions[singleSelected].enabled && singleOptionsText[singleSelected][0] == '(') drawCharacter(true, 10 + SPACING_X, singleOptions[singleSelected].posY, COLOR_RED, selected);
     }
 
     //Parse and write the new configuration

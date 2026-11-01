@@ -39,6 +39,7 @@
 #include "chainloader.h"
 
 static Firm *firm = (Firm *)0x20001000;
+u32 firmProtoVersion = 0;
 
 static __attribute__((noinline)) bool overlaps(u32 as, u32 ae, u32 bs, u32 be)
 {
@@ -151,10 +152,24 @@ static inline u32 loadFirmFromStorage(FirmwareType firmType)
 
 u32 loadNintendoFirm(FirmwareType *firmType, FirmwareSource nandType, bool loadFromStorage, bool isSafeMode)
 {
-    u32 firmVersion,
+    u32 firmVersion = 0xFFFFFFFF,
         firmSize;
 
-    bool ctrNandError = isSdMode && !mountFs(false, false);
+    bool ctrNandError = true;
+    bool loadedFromStorage = false;
+    bool storageLoadError = false;
+
+    // Try loading FIRM from sdmc first if specified.
+    if (loadFromStorage) {
+        firmSize = loadFirmFromStorage(*firmType);
+        if (firmSize != 0) loadedFromStorage = true;
+        else storageLoadError = true;
+    }
+
+    // Remount ctrnand and load FIRM from it if loading from sdmc failed.
+    if (!loadedFromStorage) {
+        ctrNandError = isSdMode && !remountCtrNandPartition(false);
+    }
 
     if(!ctrNandError)
     {
@@ -169,10 +184,8 @@ u32 loadNintendoFirm(FirmwareType *firmType, FirmwareSource nandType, bool loadF
             if(!firmSize || !checkFirm(firmSize)) ctrNandError = true;
         }
     }
-
-    bool loadedFromStorage = false;
-
-    if(loadFromStorage || ctrNandError)
+    // If CTRNAND load failed, and it wasn't tried yet, load FIRM from sdmc.
+    if (ctrNandError && !storageLoadError)
     {
         u32 result = loadFirmFromStorage(*firmType);
 
@@ -181,11 +194,83 @@ u32 loadNintendoFirm(FirmwareType *firmType, FirmwareSource nandType, bool loadF
             loadedFromStorage = true;
             firmSize = result;
         }
-        else if(ctrNandError) error("Unable to mount CTRNAND or load the CTRNAND FIRM.\nPlease use an external one.");
+        else storageLoadError = true;
     }
+    // If all attempts failed, panic.
+    if(ctrNandError && storageLoadError) error("Unable to mount CTRNAND or load the CTRNAND FIRM.\nPlease use an external one.");
 
     //Check that the FIRM is right for the console from the Arm9 section address
-    if((firm->section[3].offset != 0 ? firm->section[3].address : firm->section[2].address) != (ISN3DS ? (u8 *)0x8006000 : (u8 *)0x8006800))
+    bool isO3dsFirm = firm->section[3].offset == 0 && firm->section[2].address == (u8 *)0x8006800;
+
+    if(loadedFromStorage || ISDEVUNIT)
+    {
+        firmVersion = 0xFFFFFFFF;
+
+        if(isO3dsFirm && (*firmType == NATIVE_FIRM || *firmType == NATIVE_FIRM1X2X))
+        {
+            __attribute__((aligned(4))) static const u8 hashes[7][0x20] = {
+                {0xD7, 0x43, 0x0F, 0x27, 0x8D, 0xC9, 0x3F, 0x4C, 0x96, 0xB5, 0xA8, 0x91, 0x48, 0xDB, 0x08, 0x8A,
+                 0x7E, 0x46, 0xB3, 0x95, 0x65, 0xA2, 0x05, 0xF1, 0xF2, 0x41, 0x21, 0xF1, 0x0C, 0x59, 0x6A, 0x9D},
+                {0x82, 0xCD, 0x41, 0x1E, 0x80, 0xF6, 0xEA, 0x8C, 0xA8, 0xDE, 0x4A, 0x27, 0x5D, 0xDF, 0xFD, 0xAE,
+                 0x06, 0x4B, 0xF7, 0x21, 0x17, 0x55, 0x1F, 0x51, 0x36, 0xEB, 0x19, 0x9A, 0x8E, 0x09, 0xFA, 0x7C},
+                {0x93, 0xDF, 0x49, 0xA1, 0x24, 0x86, 0xBB, 0x6F, 0xAF, 0x49, 0x99, 0x2D, 0xD0, 0x8D, 0xB1, 0x88,
+                 0x8A, 0x00, 0xB6, 0xDD, 0x36, 0x89, 0xC0, 0xE2, 0xC9, 0xA9, 0x99, 0x62, 0x57, 0x5E, 0x6C, 0x23},
+                {0xD4, 0x91, 0xBC, 0x28, 0xFA, 0xBE, 0xC8, 0xF6, 0x80, 0xD2, 0x62, 0x51, 0xAF, 0x4B, 0x37, 0xBA,
+                 0x69, 0x1B, 0x33, 0x8B, 0x51, 0xA0, 0x35, 0x35, 0xF0, 0x2C, 0x66, 0xA6, 0x3A, 0xFB, 0xD5, 0xE7},
+                {0x39, 0x75, 0xB5, 0x28, 0x24, 0x5E, 0x8B, 0x56, 0xBC, 0x83, 0x79, 0x41, 0x09, 0x2C, 0x42, 0xE6,
+                 0x26, 0xB6, 0x80, 0x59, 0xA5, 0x56, 0xF9, 0xF9, 0x6E, 0xF3, 0x63, 0x05, 0x58, 0xDF, 0x35, 0xEF},
+                {0x81, 0x9E, 0x71, 0x58, 0xE5, 0x44, 0x73, 0xF7, 0x48, 0x78, 0x7C, 0xEF, 0x5E, 0x30, 0xE2, 0x28,
+                 0x78, 0x0B, 0x21, 0x23, 0x94, 0x63, 0xE8, 0x4E, 0x06, 0xBB, 0xD6, 0x8D, 0xA0, 0x99, 0xAE, 0x98},
+                {0x1D, 0xD5, 0xB0, 0xC2, 0xD9, 0x4A, 0x4A, 0xF3, 0x23, 0xDD, 0x2F, 0x65, 0x21, 0x95, 0x9B, 0x7E,
+                 0xF2, 0x71, 0x7E, 0xB6, 0x7A, 0x3A, 0x74, 0x78, 0x0D, 0xE3, 0xB5, 0x0C, 0x2B, 0x7F, 0x85, 0x37},
+            };
+
+            u32 i;
+            for(i = 0; i < sizeof(hashes)/sizeof(hashes[0]); i++)
+            {
+                if(memcmp(firm->section[1].hash, hashes[i], 0x20) == 0) break;
+            }
+
+            switch(i)
+            {
+                // Beta
+                case 0:
+                    firmVersion = 0x0;
+                    firmProtoVersion = 243;
+                    *firmType = NATIVE_PROTOTYPE;
+                    break;
+                case 1:
+                    firmVersion = 0x0;
+                    firmProtoVersion = 236;
+                    *firmType = NATIVE_PROTOTYPE;
+                    break;
+                case 2:
+                    firmVersion = 0x0;
+                    firmProtoVersion = 238;
+                    *firmType = NATIVE_PROTOTYPE;
+                    break;
+                case 3:
+                    firmVersion = 0x0;
+                    firmProtoVersion = 1200;
+                    *firmType = NATIVE_PROTOTYPE;
+                    break;
+                // Release
+                case 4:
+                    firmVersion = 0x18;
+                    break;
+                case 5:
+                    firmVersion = 0x1D;
+                    break;
+                case 6:
+                    firmVersion = 0x1F;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    if(*firmType != NATIVE_PROTOTYPE && (firm->section[3].offset != 0 ? firm->section[3].address : firm->section[2].address) != (ISN3DS ? (u8 *)0x8006000 : (u8 *)0x8006800))
         error("The %s FIRM is not for this console.", loadedFromStorage ? "external" : "CTRNAND");
 
     if(!ISN3DS && *firmType == NATIVE_FIRM && firm->section[0].address == (u8 *)0x1FF80000)
@@ -197,39 +282,6 @@ u32 loadNintendoFirm(FirmwareType *firmType, FirmwareSource nandType, bool loadF
         if(isSafeMode) error("SAFE_MODE is not supported on 1.x/2.x FIRM.");
 
         *firmType = NATIVE_FIRM1X2X;
-    }
-
-    if(loadedFromStorage || ISDEVUNIT)
-    {
-        firmVersion = 0xFFFFFFFF;
-
-        if(!ISN3DS && *firmType == NATIVE_FIRM)
-        {
-            __attribute__((aligned(4))) static const u8 hashes[3][0x20] = {
-                {0x39, 0x75, 0xB5, 0x28, 0x24, 0x5E, 0x8B, 0x56, 0xBC, 0x83, 0x79, 0x41, 0x09, 0x2C, 0x42, 0xE6,
-                 0x26, 0xB6, 0x80, 0x59, 0xA5, 0x56, 0xF9, 0xF9, 0x6E, 0xF3, 0x63, 0x05, 0x58, 0xDF, 0x35, 0xEF},
-                {0x81, 0x9E, 0x71, 0x58, 0xE5, 0x44, 0x73, 0xF7, 0x48, 0x78, 0x7C, 0xEF, 0x5E, 0x30, 0xE2, 0x28,
-                 0x78, 0x0B, 0x21, 0x23, 0x94, 0x63, 0xE8, 0x4E, 0x06, 0xBB, 0xD6, 0x8D, 0xA0, 0x99, 0xAE, 0x98},
-                {0x1D, 0xD5, 0xB0, 0xC2, 0xD9, 0x4A, 0x4A, 0xF3, 0x23, 0xDD, 0x2F, 0x65, 0x21, 0x95, 0x9B, 0x7E,
-                 0xF2, 0x71, 0x7E, 0xB6, 0x7A, 0x3A, 0x74, 0x78, 0x0D, 0xE3, 0xB5, 0x0C, 0x2B, 0x7F, 0x85, 0x37}
-            };
-
-            u32 i;
-            for(i = 0; i < 3; i++) if(memcmp(firm->section[1].hash, hashes[i], 0x20) == 0) break;
-
-            switch(i)
-            {
-                case 0:
-                    firmVersion = 0x18;
-                    break;
-                case 1:
-                    firmVersion = 0x1D;
-                    break;
-                case 2:
-                    firmVersion = 0x1F;
-                    break;
-            }
-        }
     }
 
     return firmVersion;
@@ -262,10 +314,147 @@ void loadHomebrewFirm(u32 pressed)
     launchFirm(wantsScreenInit ? 2 : 1, argv);
 }
 
-static inline void mergeSection0(FirmwareType firmType, u32 firmVersion, bool loadFromStorage)
+static int lzss_decompress(u8 *end)
+{
+    unsigned int v1; // r1@2
+    u8 *v2; // r2@2
+    u8 *v3; // r3@2
+    u8 *v4; // r1@2
+    char v5; // r5@4
+    char v6; // t1@4
+    signed int v7; // r6@4
+    int v9; // t1@7
+    u8 *v11; // r3@8
+    int v12; // r12@8
+    int v13; // t1@8
+    int v14; // t1@8
+    unsigned int v15; // r7@8
+    int v16; // r12@8
+    int ret;
+
+    ret = 0;
+    if ( end )
+    {
+        v1 = *((u32 *)end - 2);
+        v2 = &end[*((u32 *)end - 1)];
+        v3 = &end[-(v1 >> 24)];
+        v4 = &end[-(v1 & 0xFFFFFF)];
+        while ( v3 > v4 )
+        {
+            v6 = *(v3-- - 1);
+            v5 = v6;
+            v7 = 8;
+            while ( 1 )
+            {
+                if ( (v7-- < 1) )
+                    break;
+                if ( v5 & 0x80 )
+                {
+                    v13 = *(v3 - 1);
+                    v11 = v3 - 1;
+                    v12 = v13;
+                    v14 = *(v11 - 1);
+                    v3 = v11 - 1;
+                    v15 = ((v14 | (v12 << 8)) & 0xFFFF0FFF) + 2;
+                    v16 = v12 + 32;
+                    do
+                    {
+                        ret = v2[v15];
+                        *(v2-- - 1) = ret;
+                        v16 -= 16;
+                    }
+                    while ( !(v16 < 0) );
+                }
+                else
+                {
+                    v9 = *(v3-- - 1);
+                    ret = v9;
+                    *(v2-- - 1) = v9;
+                }
+                v5 *= 2;
+                if ( v3 <= v4 )
+                    return ret;
+            }
+        }
+    }
+    return ret;
+}
+
+typedef struct CopyKipResult {
+    u32 cxiSize;
+    u8 *codeDstAddr;
+    u32 codeSize;
+} CopyKipResult;
+
+// Copy a KIP, decompressing it in place if necessary (TwlBg)
+static CopyKipResult copyKip(u8 *dst, const u8 *src, u32 maxSize, bool decompress)
+{
+    const char *extModuleSizeError = "The external FIRM modules are too large.";
+    CopyKipResult res = { 0 };
+    Cxi *dstCxi = (Cxi *)dst;
+    const Cxi *srcCxi = (const Cxi *)src;
+
+    u32 mediaUnitShift = 9 + srcCxi->ncch.flags[6];
+    u32 totalSizeCompressed = srcCxi->ncch.contentSize << mediaUnitShift;
+
+    if (totalSizeCompressed > maxSize)
+        error(extModuleSizeError);
+
+    // First, copy the compressed KIP to the destination
+    memcpy(dst, src, totalSizeCompressed);
+
+    ExHeader *exh = &dstCxi->exHeader;
+    bool isCompressed = (exh->systemControlInfo.flag & 1) != 0;
+    ExeFsHeader *exefs = (ExeFsHeader *)(dst + (dstCxi->ncch.exeFsOffset << mediaUnitShift));
+    ExeFsFileHeader *fh = &exefs->fileHeaders[0];
+    u8 *codeAddr = (u8 *)exefs + sizeof(ExeFsHeader) + fh->offset;
+
+    if (memcmp(fh->name, ".code\0\0\0", 8) != 0 || fh->offset != 0 || exefs->fileHeaders[1].size != 0)
+        error("One of the external FIRM modules have invalid layout.");
+
+    // If it's already decompressed or we don't need to, there is not much left to do
+    if (!decompress || !isCompressed)
+    {
+        res.cxiSize = totalSizeCompressed;
+        res.codeDstAddr = codeAddr;
+        res.codeSize = fh->size;
+    }
+    else
+    {
+        u32 codeSize = exh->systemControlInfo.textCodeSet.size;
+        codeSize += exh->systemControlInfo.roCodeSet.size;
+        codeSize += exh->systemControlInfo.dataCodeSet.size;
+
+        u32 codeSizePadded = ((codeSize + (1 << mediaUnitShift) - 1) >> mediaUnitShift) << mediaUnitShift;
+        u32 newTotalSize = (codeAddr + codeSizePadded) - dst;
+        if (newTotalSize > maxSize)
+            error(extModuleSizeError);
+
+        // Decompress in place
+        lzss_decompress(codeAddr + fh->size);
+
+        // Fill padding just in case
+        memset(codeAddr + codeSize, 0, codeSizePadded - codeSize);
+
+        // Fix fields
+        fh->size = codeSize;
+        dstCxi->ncch.exeFsSize = codeSizePadded >> mediaUnitShift;
+        exh->systemControlInfo.flag &= ~1;
+        dstCxi->ncch.contentSize = newTotalSize >> mediaUnitShift;
+
+        res.cxiSize = newTotalSize;
+        res.codeDstAddr = codeAddr;
+        res.codeSize = codeSize;
+    }
+
+    return res;
+}
+static void mergeSection0(FirmwareType firmType, u32 firmVersion, bool loadFromStorage)
 {
     u32 srcModuleSize,
         nbModules = 0;
+
+    bool isLgyFirm = firmType == TWL_FIRM || firmType == AGB_FIRM;
 
     struct
     {
@@ -283,7 +472,7 @@ static inline void mergeSection0(FirmwareType firmType, u32 firmVersion, bool lo
     }
 
     // SAFE_FIRM only for N3DS and only if ENABLESAFEFIRMROSALINA is on
-    if((firmType == NATIVE_FIRM || firmType == SAFE_FIRM) && (ISN3DS || firmVersion >= 0x1D))
+    if((firmType == NATIVE_FIRM || firmType == SAFE_FIRM) && (ISN3DS || firmVersion >= 0x25))
     {
         //2) Merge that info with our own modules'
         for(u8 *src = (u8 *)0x18180000; memcmp(((Cxi *)src)->ncch.magic, "NCCH", 4) == 0; src += srcModuleSize)
@@ -309,8 +498,9 @@ static inline void mergeSection0(FirmwareType firmType, u32 firmVersion, bool lo
     u8 *dst = firm->section[0].address;
     const char *extModuleSizeError = "The external FIRM modules are too large.";
     // SAFE_FIRM only for N3DS and only if ENABLESAFEFIRMROSALINA is on
-    u32 maxModuleSize = (firmType == NATIVE_FIRM || firmType == SAFE_FIRM) ? 0x80000 : 0x600000;
-    for(u32 i = 0, dstModuleSize; i < nbModules; i++, dst += dstModuleSize, maxModuleSize -= dstModuleSize)
+    u32 maxModuleSize = !isLgyFirm ? 0x80000 : 0x600000;
+    u32 dstModuleSize = 0;
+    for(u32 i = 0; i < nbModules; i++)
     {
         if(loadFromStorage)
         {
@@ -331,29 +521,46 @@ static inline void mergeSection0(FirmwareType firmType, u32 firmVersion, bool lo
                    memcmp(moduleList[i].name, ((Cxi *)dst)->exHeader.systemControlInfo.appTitle, sizeof(((Cxi *)dst)->exHeader.systemControlInfo.appTitle)) != 0)
                     error("An external FIRM module is invalid or corrupted.");
 
+                dst += dstModuleSize;
+                maxModuleSize -= dstModuleSize;
                 continue;
             }
         }
 
-        dstModuleSize = moduleList[i].size;
+        // If not successfully loaded from storage, then...
 
-        if(dstModuleSize > maxModuleSize) error(extModuleSizeError);
+        // Decompress stock TwlBg so that we can patch it
+        bool isStockTwlBg = firmType == TWL_FIRM && strcmp(moduleList[i].name, "TwlBg") == 0;
 
-        memcpy(dst, moduleList[i].src, dstModuleSize);
+        CopyKipResult copyRes = copyKip(dst, moduleList[i].src, maxModuleSize, isStockTwlBg);
+
+        if (isStockTwlBg)
+            patchTwlBg(copyRes.codeDstAddr, copyRes.codeSize);
+
+        dst += copyRes.cxiSize;
+        maxModuleSize -= copyRes.cxiSize;
     }
 
-    //4) Patch NATIVE_FIRM/SAFE_FIRM (N3DS) if necessary
-    if(nbModules == 6)
+    //4) Patch kernel to take module size into account
+    u32 newKipSectionSize = dst - firm->section[0].address;
+    u32 oldKipSectionSize = firm->section[0].size;
+    u8 *kernel11Addr = (u8 *)firm + firm->section[1].offset;
+    u32 kernel11Size = firm->section[1].size;
+    if (isLgyFirm)
     {
-        if(patchK11ModuleLoading(firm->section[0].size, dst - firm->section[0].address, (u8 *)firm + firm->section[1].offset, firm->section[1].size) != 0)
-            error("Failed to inject custom sysmodule");
+        if (patchK11ModuleLoadingLgy(newKipSectionSize, kernel11Addr, kernel11Size) != 0)
+            error("Failed to load sysmodules");
+    }
+    else
+    {
+        if (patchK11ModuleLoading(oldKipSectionSize, newKipSectionSize, nbModules, kernel11Addr, kernel11Size) != 0)
+            error("Failed to load sysmodules");
     }
 }
 
 u32 patchNativeFirm(u32 firmVersion, FirmwareSource nandType, bool loadFromStorage, bool isFirmProtEnabled, bool needToInitSd, bool doUnitinfoPatch)
 {
-    u8 *arm9Section = (u8 *)firm + firm->section[2].offset,
-       *arm11Section1 = (u8 *)firm + firm->section[1].offset;
+    u8 *arm9Section = (u8 *)firm + firm->section[2].offset;
 
     if(ISN3DS)
     {
@@ -367,34 +574,41 @@ u32 patchNativeFirm(u32 firmVersion, FirmwareSource nandType, bool loadFromStora
         process9MemAddr;
     u8 *process9Offset = getProcess9Info(arm9Section, firm->section[2].size, &process9Size, &process9MemAddr);
 
-    //Find the Kernel11 SVC table and handler, exceptions page and free space locations
-    u32 baseK11VA;
-    u8 *freeK11Space;
-    u32 *arm11SvcHandler,
-        *arm11ExceptionsPage,
-        *arm11SvcTable = getKernel11Info(arm11Section1, firm->section[1].size, &baseK11VA, &freeK11Space, &arm11SvcHandler, &arm11ExceptionsPage);
-
     u32 kernel9Size = (u32)(process9Offset - arm9Section) - sizeof(Cxi) - 0x200,
         ret = 0;
 
-    //Skip on FIRMs < 4.0
-    if(ISN3DS || firmVersion >= 0x1D)
+#ifndef BUILD_FOR_EXPLOIT_DEV
+    //Skip on FIRMs < 5.0
+    if(ISN3DS || firmVersion >= 0x25)
     {
+        //Find the Kernel11 SVC table and handler, exceptions page and free space locations
+        u8 *arm11Section1 = (u8 *)firm + firm->section[1].offset;
+        u32 baseK11VA;
+        u8 *freeK11Space;
+        u32 *arm11SvcHandler,
+            *arm11ExceptionsPage,
+            *arm11SvcTable = getKernel11Info(arm11Section1, firm->section[1].size, &baseK11VA, &freeK11Space, &arm11SvcHandler, &arm11ExceptionsPage);
+
         ret += installK11Extension(arm11Section1, firm->section[1].size, needToInitSd, baseK11VA, arm11ExceptionsPage, &freeK11Space);
         ret += patchKernel11(arm11Section1, firm->section[1].size, baseK11VA, arm11SvcTable, arm11ExceptionsPage);
     }
+#else
+    (void)needToInitSd;
+#endif
 
     //Apply signature patches
     ret += patchSignatureChecks(process9Offset, process9Size);
 
     //Apply EmuNAND patches
-    if(nandType != FIRMWARE_SYSNAND) ret += patchEmuNand(arm9Section, kernel9Size, process9Offset, process9Size, firm->section[2].address, firmVersion);
+    if(nandType != FIRMWARE_SYSNAND) ret += patchEmuNand(process9Offset, process9Size, firmVersion);
 
     //Apply FIRM0/1 writes patches on SysNAND to protect A9LH
     else if(isFirmProtEnabled) ret += patchFirmWrites(process9Offset, process9Size);
 
+#ifndef BUILD_FOR_EXPLOIT_DEV
     //Apply firmlaunch patches
     ret += patchFirmlaunches(process9Offset, process9Size, process9MemAddr);
+#endif
 
     //Apply dev unit check patches related to NCCH encryption
     if(!ISDEVUNIT)
@@ -431,6 +645,11 @@ u32 patchNativeFirm(u32 firmVersion, FirmwareSource nandType, bool loadFromStora
 
 u32 patchTwlFirm(u32 firmVersion, bool loadFromStorage, bool doUnitinfoPatch)
 {
+    u8 *section1 = (u8 *)firm + firm->section[1].offset;
+    u32 section1Size = firm->section[1].size;
+    u8 *section2 = (u8 *)firm + firm->section[2].offset;
+    u32 section2Size = firm->section[2].size;
+
     u8 *arm9Section = (u8 *)firm + firm->section[3].offset;
 
     // Below 3.0, do not actually do anything.
@@ -463,11 +682,11 @@ u32 patchTwlFirm(u32 firmVersion, bool loadFromStorage, bool doUnitinfoPatch)
     //Apply UNITINFO patch
     if(doUnitinfoPatch) ret += patchUnitInfoValueSet(arm9Section, kernel9Size);
 
-    if(loadFromStorage)
-    {
-        mergeSection0(TWL_FIRM, 0, true);
-        firm->section[0].size = 0;
-    }
+    ret += patchLgyK11(section1, section1Size, section2, section2Size);
+
+    // Also patch TwlBg here
+    mergeSection0(TWL_FIRM, 0, loadFromStorage);
+    firm->section[0].size = 0;
 
     return ret;
 }
@@ -475,6 +694,11 @@ u32 patchTwlFirm(u32 firmVersion, bool loadFromStorage, bool doUnitinfoPatch)
 u32 patchAgbFirm(bool loadFromStorage, bool doUnitinfoPatch)
 {
     u8 *arm9Section = (u8 *)firm + firm->section[3].offset;
+
+    u8 *section1 = (u8 *)firm + firm->section[1].offset;
+    u32 section1Size = firm->section[1].size;
+    u8 *section2 = (u8 *)firm + firm->section[2].offset;
+    u32 section2Size = firm->section[2].size;
 
     //On N3DS, decrypt Arm9Bin and patch Arm9 entrypoint to skip kernel9loader
     if(ISN3DS)
@@ -493,6 +717,7 @@ u32 patchAgbFirm(bool loadFromStorage, bool doUnitinfoPatch)
 
     ret += patchLgySignatureChecks(process9Offset, process9Size);
     if(CONFIG(SHOWGBABOOT)) ret += patchAgbBootSplash(process9Offset, process9Size);
+    ret += patchLgyK11(section1, section1Size, section2, section2Size);
 
     //Apply UNITINFO patch
     if(doUnitinfoPatch) ret += patchUnitInfoValueSet(arm9Section, kernel9Size);
@@ -558,6 +783,108 @@ u32 patch1x2xNativeAndSafeFirm(void)
         mergeSection0(NATIVE_FIRM, 0x45, false); // may change in the future
         firm->section[0].size = 0;
     }
+
+    return ret;
+}
+
+struct b9_key {
+    u8 keyslot;
+    u16 b9_offs;
+};
+
+static const struct b9_key key_X[23] = {
+    { .keyslot = 0x2C, .b9_offs = 0xDDD0 }, { .keyslot = 0x2D, .b9_offs = 0xDDD0 },
+    { .keyslot = 0x2E, .b9_offs = 0xDDD0 }, { .keyslot = 0x2F, .b9_offs = 0xDDD0 },
+    { .keyslot = 0x30, .b9_offs = 0xDDE0 }, { .keyslot = 0x31, .b9_offs = 0xDDE0 },
+    { .keyslot = 0x32, .b9_offs = 0xDDE0 }, { .keyslot = 0x33, .b9_offs = 0xDDE0 },
+    { .keyslot = 0x34, .b9_offs = 0xDDF0 }, { .keyslot = 0x35, .b9_offs = 0xDDF0 },
+    { .keyslot = 0x36, .b9_offs = 0xDDF0 }, { .keyslot = 0x37, .b9_offs = 0xDDF0 },
+    { .keyslot = 0x38, .b9_offs = 0xDE00 }, { .keyslot = 0x39, .b9_offs = 0xDE00 },
+    { .keyslot = 0x3A, .b9_offs = 0xDE00 }, { .keyslot = 0x3B, .b9_offs = 0xDE00 },
+    { .keyslot = 0x3C, .b9_offs = 0xDE10 }, { .keyslot = 0x3D, .b9_offs = 0xDE20 },
+    { .keyslot = 0x3E, .b9_offs = 0xDE30 }, { .keyslot = 0x3F, .b9_offs = 0xDE40 },
+};
+static const struct b9_key key_Y[9] = {
+    { .keyslot = 0x8, .b9_offs = 0xDE90 }, { .keyslot = 0x9, .b9_offs = 0xDEA0 },
+    { .keyslot = 0xA, .b9_offs = 0xDEB0 }, { .keyslot = 0xB, .b9_offs = 0xDEC0 },
+};
+
+static const u8 boot9Sha256[32] = {
+    0x2F, 0x88, 0x74, 0x4F, 0xEE, 0xD7, 0x17, 0x85, 0x63, 0x86, 0x40, 0x0A, 0x44, 0xBB, 0xA4, 0xB9,
+    0xCA, 0x62, 0xE7, 0x6A, 0x32, 0xC7, 0x15, 0xD4, 0xF3, 0x09, 0xC3, 0x99, 0xBF, 0x28, 0x16, 0x6F,
+};
+
+static void load_key(u8 keyslot, const u8 *key, u8 keytype) {
+    const u32 *key32 = (u32 *)key;
+    *REG_AESCNT = (*REG_AESCNT & ~(AES_CNT_INPUT_ENDIAN | AES_CNT_INPUT_ORDER)) | AES_INPUT_BE | AES_INPUT_NORMAL;
+    *REG_AESKEYCNT = (*REG_AESKEYCNT >> 6 << 6) | keyslot | AES_KEYCNT_WRITE;
+    
+    REG_AESKEYFIFO[keytype] = key32[0];
+    REG_AESKEYFIFO[keytype] = key32[1];
+    REG_AESKEYFIFO[keytype] = key32[2];
+    REG_AESKEYFIFO[keytype] = key32[3];
+}
+
+u32 patchPrototypeNative(FirmwareSource nandType, bool doUnitinfoPatch)
+{
+    u8 *arm9Section = (u8 *)firm + firm->section[2].offset;
+
+    //Find the Process9 .code location, size and memory address
+    u32 process9Size = 0;
+    u32 process9MemAddr = 0;
+    u8 *process9Offset = getProcess9Info(arm9Section, firm->section[2].size, &process9Size, &process9MemAddr);
+
+    u32 kernel9Size = (u32)(process9Offset - arm9Section) - sizeof(Cxi) - 0x200;
+    u32 ret = 0;
+        
+    if(doUnitinfoPatch && !ISDEVUNIT)
+    {
+        if (firmProtoVersion == 1200)
+        {
+            u8 b9[0x10000] = { 0 };
+            u32 hash[4] = { 0 };
+            sha(hash, (const void *)0x08080000, 0x10000, SHA_256_MODE);
+            
+            if (memcmp(hash, boot9Sha256, 32) != 0)
+            {
+                u32 size = getFileSize("sdmc:/luma/backups/boot9.bin");
+                int readres = fileRead(b9, "sdmc:/luma/backups/boot9.bin", 0x10000);
+                sha(hash, b9, 0x10000, SHA_256_MODE);
+                
+                if (size != 0x10000 || !readres || memcmp(hash, boot9Sha256, 32) != 0)
+                    error("No valid boot9 backup was found in memory or in\nsdmc:/luma/backups/boot9.bin. Please make sure\nyou have a valid backup to use this FIRM.");
+            }
+            else
+            {
+                memcpy(b9, (const void *)0x08080000, 0x10000);
+            }
+            
+            for (u32 i = 0; i < sizeof(key_X) / sizeof(key_X[0]); i++)
+            {
+                load_key(key_X[i].keyslot, &b9[key_X[i].b9_offs], AES_KEYX);
+            }
+            
+            for (u32 i = 0; i < sizeof(key_Y) / sizeof(key_Y[0]); i++)
+            {
+                load_key(key_Y[i].keyslot, &b9[key_Y[i].b9_offs], AES_KEYY);
+            }
+                        
+            static const u8 dev_keyX_0x25[16] = { 0x81,0x90,0x7A,0x4B,0x6F,0x1B,0x47,0x32,
+                                                  0x3A,0x67,0x79,0x74,0xCE,0x4A,0xD7,0x1B };
+            
+            load_key(0x25, dev_keyX_0x25, AES_KEYX);
+                        
+            ret += patchProtoUnitinfo1200(process9Offset, process9Size, arm9Section, firm->section[2].size);
+        }
+    }
+    
+    ret += patchProtoNandSignatureCheck(process9Offset, process9Size);
+
+    //Arm9 exception handlers
+    ret += patchArm9ExceptionHandlersInstall(arm9Section, kernel9Size);
+
+    //Apply EmuNAND patches
+    if(nandType != FIRMWARE_SYSNAND) ret += patchProtoEmuNand(process9Offset, process9Size);
 
     return ret;
 }

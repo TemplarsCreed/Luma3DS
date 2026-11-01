@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "strings.h"
 #include "romfsredir.h"
+#include "util.h"
 
 static u32 patchMemory(u8 *start, u32 size, const void *pattern, u32 patSize, s32 offset, const void *replace, u32 repSize, u32 count)
 {
@@ -147,7 +148,7 @@ static u32 findFunctionStart(u8 *code, u32 pos)
     return 0xFFFFFFFF;
 }
 
-static inline bool findLayeredFsSymbols(u8 *code, u32 size, u32 *fsMountArchive, u32 *fsRegisterArchive, u32 *fsTryOpenFile, u32 *fsOpenFileDirectly)
+static inline bool findLayeredFsSymbols(u8 *code, u32 size, u32 *fsMountArchive, u32 *fsRegisterArchive, u32 *fsTryOpenFile, u32 *fsOpenFileDirectly, u32 *fsUnmountArchive)
 {
     u32 found = 0,
         *temp = NULL;
@@ -163,6 +164,12 @@ static inline bool findLayeredFsSymbols(u8 *code, u32 size, u32 *fsMountArchive,
                 break;
             case 0xE24DD028:
                 if(addr <= size - 16 && *fsMountArchive == 0xFFFFFFFF && addr32[1] == 0xE1A04000 && addr32[2] == 0xE59F60A8 && addr32[3] == 0xE3A0C001) temp = fsMountArchive;
+                break;
+            case 0xE2844001:
+                if(addr <= size - 12 && *fsUnmountArchive == 0xFFFFFFFF && addr32[1] == 0xE3540020 && addr32[2] == 0x3AFFFFF0) temp = fsUnmountArchive;
+                break;
+            case 0xE353003A:
+                if(addr <= size - 12 && *fsUnmountArchive == 0xFFFFFFFF && (addr32[1] & 0xFFFFFF0F) == 0x0A000009 && (addr32[2] & 0xFFFF0FF0) == 0xE1A00400) temp = fsUnmountArchive;
                 break;
             case 0xE3500008:
                 if(addr <= size - 12 && *fsRegisterArchive == 0xFFFFFFFF && (addr32[1] & 0xFFF00FF0) == 0xE1800400 && (addr32[2] & 0xFFF00FF0) == 0xE1800FC0) temp = fsRegisterArchive;
@@ -182,14 +189,14 @@ static inline bool findLayeredFsSymbols(u8 *code, u32 size, u32 *fsMountArchive,
             if(*temp != 0xFFFFFFFF)
             {
                 found++;
-                if(found == 4) break;
+                if(found == 5) break;
             }
 
             temp = NULL;
         }
     }
 
-    return found == 4;
+    return (found == 5 || (found == 4 && *fsUnmountArchive == 0xFFFFFFFF));
 }
 
 static inline bool findLayeredFsPayloadOffset(u8 *code, u32 size, u32 roSize, u32 dataSize, u32 roAddress, u32 dataAddress, u32 *payloadOffset, u32 *pathOffset, u32 *pathAddress)
@@ -259,57 +266,166 @@ static inline bool findLayeredFsPayloadOffset(u8 *code, u32 size, u32 roSize, u3
     return *payloadOffset != 0 && *pathOffset != 0;
 }
 
-static inline bool applyCodeIpsPatch(u64 progId, u8 *code, u32 size)
+typedef struct PatchFileReader
+{
+    IFile *file;
+    u8 *buf;
+    u32 pos;
+    u32 len;
+    bool eof;
+} PatchFileReader;
+
+// FS reads are slow when the destination isn't 4-byte aligned and when they are small,
+// so buffer the file and only ever issue reads of whole sectors at sector-aligned file offsets
+#define PATCH_SECTOR_SIZE 0x200
+#define PATCH_BUFFER_SIZE (2 * PATCH_SECTOR_SIZE)
+
+static alignas(32) u8 patchFileBuffer[PATCH_BUFFER_SIZE];
+
+static bool patchFileReaderFill(PatchFileReader *reader)
+{
+    u64 total;
+
+    reader->pos = 0;
+    reader->len = 0;
+
+    if(reader->eof || R_FAILED(IFile_Read(reader->file, &total, reader->buf, PATCH_BUFFER_SIZE)))
+        return false;
+
+    reader->len = (u32)total;
+    reader->eof = total != PATCH_BUFFER_SIZE;
+
+    return total != 0;
+}
+
+static bool patchFileRead(void *outData, u32 len, PatchFileReader *reader)
+{
+    u8 *out = (u8 *)outData;
+
+    while(len != 0)
+    {
+        if(reader->pos == reader->len)
+        {
+            // The buffer is drained and the file position is sector-aligned: read large chunks directly when possible
+            if(!reader->eof && len >= PATCH_SECTOR_SIZE && ((u32)out & 3) == 0)
+            {
+                u32 directLen = len & ~(PATCH_SECTOR_SIZE - 1);
+                u64 total;
+
+                if(R_FAILED(IFile_Read(reader->file, &total, out, directLen)) || total != directLen) return false;
+
+                out += directLen;
+                len -= directLen;
+                continue;
+            }
+
+            if(!patchFileReaderFill(reader)) return false;
+        }
+
+        u32 chunk = reader->len - reader->pos;
+        if(chunk > len) chunk = len;
+
+        memcpy(out, reader->buf + reader->pos, chunk);
+        reader->pos += chunk;
+        out += chunk;
+        len -= chunk;
+    }
+
+    return true;
+}
+
+// Make [offset, offset + size) writable. Records past the end grow the file, and the gap
+// they leave is zero-filled like desktop patchers do. Empty records change nothing
+static bool ipsGrowToFit(u8 *code, u32 *patchedSize, u32 maxSize, u32 offset, u32 size)
+{
+    if(offset + size > maxSize) return false;
+    if(size == 0) return true;
+
+    if(offset > *patchedSize) memset(code + *patchedSize, 0, offset - *patchedSize);
+    if(offset + size > *patchedSize) *patchedSize = offset + size;
+
+    return true;
+}
+
+static inline bool applyCodeIpsPatch(u8 *code, u32 *codeSize, u32 maxSize, u64 progId)
 {
     /* Here we look for "/luma/titles/[u64 titleID in hex, uppercase]/code.ips"
        If it exists it should be an IPS format patch */
 
-    char path[] = "/luma/titles/0000000000000000/code.ips";
-    progIdToStr(path + 28, progId);
-
+    bool isSysmodule = (progId >> 32) == 0x00040130;
     IFile file;
 
-    if(!openLumaFile(&file, path)) return true;
+    if (isSysmodule)
+    {
+        char path[] = "/luma/sysmodules/0000000000000000.ips";
+        progId &= ~0xF0000000ull; // clear N3DS bit
+        progIdToStr(path + 32, progId);
+        if(!openLumaFile(&file, path)) return true;
+    }
+    else
+    {
+        char path[] = "/luma/titles/0000000000000000/code.ips";
+        progIdToStr(path + 28, progId);
+        if(!openLumaFile(&file, path)) return true;
+    }
 
     bool ret = false;
     u8 buffer[5];
-    u64 total;
+    u32 patchedSize = *codeSize;
+    PatchFileReader reader = { .file = &file, .buf = patchFileBuffer, .pos = 0, .len = 0, .eof = false };
 
-    if(R_FAILED(IFile_Read(&file, &total, buffer, 5)) || total != 5 || memcmp(buffer, "PATCH", 5) != 0) goto exit;
+    if(!patchFileRead(buffer, 5, &reader) || memcmp(buffer, "PATCH", 5) != 0) goto exit;
 
-    while(R_SUCCEEDED(IFile_Read(&file, &total, buffer, 3)) && total == 3)
+    while(patchFileRead(buffer, 3, &reader))
     {
         if(memcmp(buffer, "EOF", 3) == 0)
         {
+            // Optional extension: new file size after the EOF marker. Anything else is invalid
+            u32 trailerSize = 0;
+            while(trailerSize < 4 && patchFileRead(buffer + trailerSize, 1, &reader)) trailerSize++;
+
+            if(trailerSize != 0 && trailerSize != 3) break;
+
+            if(trailerSize == 3)
+            {
+                u32 newSize = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
+
+                if(newSize > maxSize) break;
+
+                // Zero the cut-off tail, or zerofill up to the new size for consistency with UPS
+                if(newSize < patchedSize) memset(code + newSize, 0, patchedSize - newSize);
+                else memset(code + patchedSize, 0, newSize - patchedSize);
+
+                patchedSize = newSize;
+            }
+
+            *codeSize = patchedSize;
             ret = true;
             break;
         }
 
         u32 offset = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
 
-        if(R_FAILED(IFile_Read(&file, &total, buffer, 2)) || total != 2) break;
+        if(!patchFileRead(buffer, 2, &reader)) break;
 
         u32 patchSize = (buffer[0] << 8) | buffer[1];
 
         if(!patchSize)
         {
-            if(R_FAILED(IFile_Read(&file, &total, buffer, 2)) || total != 2) break;
+            if(!patchFileRead(buffer, 3, &reader)) break;
 
             u32 rleSize = (buffer[0] << 8) | buffer[1];
 
-            if(offset + rleSize > size) break;
+            if(!ipsGrowToFit(code, &patchedSize, maxSize, offset, rleSize)) break;
 
-            if(R_FAILED(IFile_Read(&file, &total, buffer, 1)) || total != 1) break;
-
-            for(u32 i = 0; i < rleSize; i++)
-                code[offset + i] = buffer[0];
+            memset(code + offset, buffer[2], rleSize);
 
             continue;
         }
 
-        if(offset + patchSize > size) break;
+        if(!ipsGrowToFit(code, &patchedSize, maxSize, offset, patchSize)) break;
 
-        if(R_FAILED(IFile_Read(&file, &total, code + offset, patchSize)) || total != patchSize) break;
+        if(!patchFileRead(code + offset, patchSize, &reader)) break;
     }
 
 exit:
@@ -318,7 +434,198 @@ exit:
     return ret;
 }
 
-bool loadTitleCodeSection(u64 progId, u8 *code, u32 size)
+// UPS patches end with 3 CRC32s (input, output, patch), which we don't check
+#define UPS_FOOTER_SIZE 12
+
+static bool upsReadByte(u8 *outByte, PatchFileReader *reader, u32 *left)
+{
+    if(*left == 0) return false;
+    --*left;
+
+    if(reader->pos != reader->len)
+    {
+        *outByte = reader->buf[reader->pos++];
+        return true;
+    }
+
+    return patchFileRead(outByte, 1, reader);
+}
+
+static bool upsReadVuint(u32 *outValue, PatchFileReader *reader, u32 *left)
+{
+    u64 result = 0;
+
+    for(u32 shift = 0; shift < 32; shift += 7)
+    {
+        u8 b;
+
+        if(!upsReadByte(&b, reader, left)) return false;
+
+        result += (u64)(b & 0x7F) << shift;
+        if(!(b & 0x80)) result += 1ull << (shift + 7);
+
+        if(result > 0xFFFFFFFF) return false;
+
+        if(b & 0x80)
+        {
+            *outValue = (u32)result;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static inline bool applyCodeUpsPatch(u8 *code, u32 *codeSize, u32 maxSize, u64 progId)
+{
+    /* Here we look for "/luma/titles/[u64 titleID in hex, uppercase]/code.ups"
+       If it exists it should be an UPS format patch */
+
+    bool isSysmodule = (progId >> 32) == 0x00040130;
+    IFile file;
+
+    if (isSysmodule)
+    {
+        char path[] = "/luma/sysmodules/0000000000000000.ups";
+        progId &= ~0xF0000000ull; // clear N3DS bit
+        progIdToStr(path + 32, progId);
+        if(!openLumaFile(&file, path)) return true;
+    }
+    else
+    {
+        char path[] = "/luma/titles/0000000000000000/code.ups";
+        progIdToStr(path + 28, progId);
+        if(!openLumaFile(&file, path)) return true;
+    }
+
+    bool ret = false;
+    u64 fileSize;
+    u8 header[4];
+    u32 left, baseSize, patchedSize, xorSize, offset = 0;
+    PatchFileReader reader = { .file = &file, .buf = patchFileBuffer, .pos = 0, .len = 0, .eof = false };
+
+    if(R_FAILED(IFile_GetSize(&file, &fileSize)) || fileSize < sizeof(header) + UPS_FOOTER_SIZE || fileSize > 0xFFFFFFFF) goto exit;
+
+    // Number of bytes left before the footer
+    left = (u32)fileSize - UPS_FOOTER_SIZE - sizeof(header);
+
+    if(!patchFileRead(header, sizeof(header), &reader) || memcmp(header, "UPS1", 4) != 0) goto exit;
+
+    if(!upsReadVuint(&baseSize, &reader, &left) || !upsReadVuint(&patchedSize, &reader, &left)) goto exit;
+    if(baseSize != *codeSize || patchedSize > maxSize) goto exit;
+
+    // XOR records cover the larger file, bytes past the base size are expected to be zero
+    xorSize = baseSize > patchedSize ? baseSize : patchedSize;
+    if(patchedSize > baseSize) memset(code + baseSize, 0, patchedSize - baseSize);
+
+    while(left != 0)
+    {
+        u32 delta;
+
+        if(!upsReadVuint(&delta, &reader, &left) || delta > xorSize - offset) goto exit;
+
+        offset += delta;
+
+        if(offset == xorSize)
+        {
+            // No more bytes may be modified
+            if(left != 0) goto exit;
+            break;
+        }
+
+        for(;;)
+        {
+            u8 mask;
+
+            if(!upsReadByte(&mask, &reader, &left)) goto exit;
+
+            if(mask == 0)
+            {
+                // The terminator skips one unchanged byte
+                if(offset < xorSize) offset++;
+                break;
+            }
+
+            if(offset >= xorSize) goto exit;
+
+            code[offset++] ^= mask;
+        }
+    }
+
+    *codeSize = patchedSize;
+    ret = true;
+
+exit:
+    IFile_Close(&file);
+
+    return ret;
+}
+
+Result openSysmoduleCxi(IFile *outFile, u64 progId)
+{
+    progId &= ~0xF0000000ull; // clear N3DS bit
+    char path[] = "/luma/sysmodules/0000000000000000.cxi";
+    progIdToStr(path + sizeof("/luma/sysmodules/0000000000000000") - 2, progId);
+
+    FS_ArchiveID archiveId = isSdMode ? ARCHIVE_SDMC : ARCHIVE_NAND_RW;
+    return fileOpen(outFile, archiveId, path, FS_OPEN_READ);
+}
+
+bool readSysmoduleCxiNcchHeader(Ncch *outNcchHeader, IFile *file)
+{
+    u64 total = 0;
+    return R_SUCCEEDED(IFile_ReadAt(file, &total, outNcchHeader, 0, sizeof(Ncch))) && total == sizeof(Ncch);
+}
+
+bool readSysmoduleCxiExHeaderInfo(ExHeader_Info *outExhi, const Ncch *ncchHeader, IFile *file)
+{
+    u64 total = 0;
+    u32 size = ncchHeader->exHeaderSize;
+    if (size < sizeof(ExHeader_Info))
+        return false;
+    return R_SUCCEEDED(IFile_ReadAt(file, &total, outExhi, sizeof(Ncch), size)) && total == size;
+}
+
+bool readSysmoduleCxiCode(u8 *outCode, u32 *outSize, u32 maxSize, IFile *file, const Ncch *ncchHeader)
+{
+    u32 contentUnitShift = 9 + ncchHeader->flags[6];
+    u32 exeFsOffset = ncchHeader->exeFsOffset << contentUnitShift;
+    u32 exeFsSize = ncchHeader->exeFsSize << contentUnitShift;
+
+    if (exeFsSize < sizeof(ExeFsHeader) || exeFsOffset < 0x200 + ncchHeader->exHeaderSize)
+        return false;
+
+    // Read ExeFs header
+    ExeFsHeader hdr;
+    u64 total = 0;
+    u32 size = sizeof(ExeFsHeader);
+    Result res = IFile_ReadAt(file, &total, &hdr, exeFsOffset, size);
+
+    if (R_FAILED(res) || total != size)
+        return false;
+
+    // Get .code section info
+    ExeFsFileHeader *codeHdr = NULL;
+    for (u32 i = 0; i < 8; i++)
+    {
+        ExeFsFileHeader *fileHdr = &hdr.fileHeaders[i];
+        if (strncmp(fileHdr->name, ".code", 8) == 0)
+            codeHdr = fileHdr;
+    }
+
+    if (codeHdr == NULL)
+        return false;
+
+    size = codeHdr->size;
+    *outSize = size;
+    if (size > maxSize)
+        return false;
+
+    res = IFile_ReadAt(file, &total, outCode, exeFsOffset + sizeof(ExeFsHeader) + codeHdr->offset, size);
+    return R_SUCCEEDED(res) && total == size;
+}
+
+bool loadTitleCodeSection(u8 *outCode, u32 *outSize, u32 maxSize, u64 progId)
 {
     /* Here we look for "/luma/titles/[u64 titleID in hex, uppercase]/code.bin"
        If it exists it should be a decrypted and decompressed binary code file */
@@ -332,12 +639,14 @@ bool loadTitleCodeSection(u64 progId, u8 *code, u32 size)
 
     u64 fileSize;
 
-    if(R_FAILED(IFile_GetSize(&file, &fileSize)) || fileSize > size) goto error;
+    if(R_FAILED(IFile_GetSize(&file, &fileSize)) || fileSize > maxSize) goto error;
     else
     {
         u64 total;
 
-        if(R_FAILED(IFile_Read(&file, &total, code, fileSize)) || total != fileSize) goto error;
+        if(R_FAILED(IFile_Read(&file, &total, outCode, fileSize)) || total != fileSize) goto error;
+
+        *outSize = (u32)fileSize;
     }
 
     IFile_Close(&file);
@@ -403,7 +712,7 @@ static inline bool loadTitleLocaleConfig(u64 progId, u8 *mask, u8 *regionId, u8 
     if(R_FAILED(IFile_GetSize(&file, &fileSize)) || fileSize < 3) goto exit;
     if(fileSize >= 12) fileSize = 12;
 
-    char buf[12] = "------------";
+    char buf[12+1] = "------------";
     u64 total;
 
     if(R_FAILED(IFile_Read(&file, &total, buf, fileSize))) goto exit;
@@ -427,7 +736,7 @@ static inline bool loadTitleLocaleConfig(u64 progId, u8 *mask, u8 *regionId, u8 
                                       "HK", "MO", "--", "--", "--", "--", "--", "--", "ID", "SG", "TH", "PH",
                                       "MY", "--", "--", "--", "CN", "--", "--", "--", "--", "--", "--", "--",
                                       "AE", "IN", "EG", "OM", "QA", "KW", "SA", "SY", "BH", "JO", "--", "--",
-                                      "--", "--", "--", "--", "SM", "VA"};
+                                      "--", "--", "--", "--", "SM", "VA", "BM"};
 
     u32 i;
     for(i = 0; i < sizeof(regions) / sizeof(char *); i++)
@@ -494,6 +803,7 @@ static inline bool patchLayeredFs(u64 progId, u8 *code, u32 size, u32 textSize, 
     if(!archiveId) return true;
 
     u32 fsMountArchive = 0xFFFFFFFF,
+        fsUnmountArchive = 0xFFFFFFFF,
         fsRegisterArchive = 0xFFFFFFFF,
         fsTryOpenFile = 0xFFFFFFFF,
         fsOpenFileDirectly = 0xFFFFFFFF,
@@ -501,24 +811,44 @@ static inline bool patchLayeredFs(u64 progId, u8 *code, u32 size, u32 textSize, 
         pathOffset = 0,
         pathAddress = 0xDEADCAFE;
 
-    if(!findLayeredFsSymbols(code, textSize, &fsMountArchive, &fsRegisterArchive, &fsTryOpenFile, &fsOpenFileDirectly) ||
+    if(!findLayeredFsSymbols(code, textSize, &fsMountArchive, &fsRegisterArchive, &fsTryOpenFile, &fsOpenFileDirectly, &fsUnmountArchive) ||
        !findLayeredFsPayloadOffset(code, textSize, roSize, dataSize, roAddress, dataAddress, &payloadOffset, &pathOffset, &pathAddress)) return false;
 
-    static const char *updateRomFsMounts[] = { "rom2:",
+    static const char *updateRomFsMounts[] = { "ro2:",
+                                               "rom2:",
                                                "rex:",
                                                "patch:",
                                                "ext:",
                                                "rom:" };
-    u32 updateRomFsIndex;
 
-    //Locate update RomFSes
-    for(updateRomFsIndex = 0; updateRomFsIndex < sizeof(updateRomFsMounts) / sizeof(char *) - 1; updateRomFsIndex++)
+    bool isMarioKart7 = (u32)progId == 0x00030600 || //JPN MK7
+                        (u32)progId == 0x00030700 || //EUR MK7
+                        (u32)progId == 0x00030800 || //USA MK7
+                        (u32)progId == 0x00030A00 || //KOR MK7
+                        (u32)progId == 0x0008B400;   //TWN MK7
+                        // Exclude CHN as it never got updates
+
+    const char *updateRomFsMount;
+
+    if (isMarioKart7)
     {
-        u32 patternSize = strlen(updateRomFsMounts[updateRomFsIndex]);
-        u8 temp[7];
-        temp[0] = 0;
-        memcpy(temp + 1, updateRomFsMounts[updateRomFsIndex], patternSize);
-        if(memsearch(code, temp, size, patternSize + 1) != NULL) break;
+        updateRomFsMount = "pat1"; // Isolated to prevent false-positives
+    }
+
+    else
+    {
+        u32 updateRomFsIndex;
+
+        //Locate update RomFS
+        for(updateRomFsIndex = 0; updateRomFsIndex < sizeof(updateRomFsMounts) / sizeof(char *) - 1; updateRomFsIndex++)
+        {
+            u32 patternSize = strlen(updateRomFsMounts[updateRomFsIndex]);
+            u8 temp[7];
+            temp[0] = 0;
+            memcpy(temp + 1, updateRomFsMounts[updateRomFsIndex], patternSize);
+            if(memsearch(code, temp, size, patternSize + 1) != NULL) break;
+        }
+        updateRomFsMount = updateRomFsMounts[updateRomFsIndex];
     }
 
     //Setup the payload
@@ -529,10 +859,13 @@ static inline bool patchLayeredFs(u64 progId, u8 *code, u32 size, u32 textSize, 
     romfsRedirPatchSubstituted2 = *(u32 *)(code + fsTryOpenFile);
     romfsRedirPatchHook2 = MAKE_BRANCH(payloadOffset + (u32)&romfsRedirPatchHook2 - (u32)romfsRedirPatch, fsTryOpenFile + 4);
     romfsRedirPatchCustomPath = pathAddress;
-    romfsRedirPatchFsMountArchive = 0x100000 + fsMountArchive;
-    romfsRedirPatchFsRegisterArchive = 0x100000 + fsRegisterArchive;
+    romfsRedirPatchFsMountArchive = MAKE_BRANCH_LINK(payloadOffset + (u32)&romfsRedirPatchFsMountArchive - (u32)romfsRedirPatch, fsMountArchive);
+    romfsRedirPatchFsUnmountArchive = (fsUnmountArchive != 0xFFFFFFFF) ?
+        MAKE_BRANCH_LINK(payloadOffset + (u32)&romfsRedirPatchFsUnmountArchive - (u32)romfsRedirPatch, fsUnmountArchive) :
+        0xE320F000; // NOP if fsUnmountArchive doesn't exist
+    romfsRedirPatchFsRegisterArchive = MAKE_BRANCH_LINK(payloadOffset + (u32)&romfsRedirPatchFsRegisterArchive - (u32)romfsRedirPatch, fsRegisterArchive);
     romfsRedirPatchArchiveId = archiveId;
-    memcpy(&romfsRedirPatchUpdateRomFsMount, updateRomFsMounts[updateRomFsIndex], 4);
+    memcpy(&romfsRedirPatchUpdateRomFsMount, updateRomFsMount, 4);
 
     memcpy(payload, romfsRedirPatch, romfsRedirPatchSize);
 
@@ -546,14 +879,18 @@ static inline bool patchLayeredFs(u64 progId, u8 *code, u32 size, u32 textSize, 
     return true;
 }
 
-void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 roSize, u32 dataSize, u32 roAddress, u32 dataAddress)
+void patchCode(u8 *code, u32 size, u32 codeSize, u64 progId, u16 progVer, u32 textSize, u32 roSize, u32 dataSize, u32 roAddress, u32 dataAddress)
 {
-    bool isHomeMenu = progId == 0x0004003000008F02LL || //USA Home Menu
-                      progId == 0x0004003000008202LL || //JPN Home Menu
-                      progId == 0x0004003000009802LL || //EUR Home Menu
-                      progId == 0x000400300000A902LL || //KOR Home Menu
-                      progId == 0x000400300000A102LL || //CHN Home Menu
-                      progId == 0x000400300000B102LL;   //TWN Home Menu
+    bool isHomeMenu = progId == 0x0004003000008F02LL || //USA HOME Menu
+                      progId == 0x0004003000008202LL || //JPN HOME Menu
+                      progId == 0x0004003000009802LL || //EUR HOME Menu
+                      progId == 0x000400300000A902LL || //KOR HOME Menu
+                      progId == 0x000400300000A102LL || //CHN HOME Menu
+                      progId == 0x000400300000B102LL;   //TWN HOME Menu
+
+    bool isApp = ((progId >> 32) & ~0x12) == 0x00040000;
+    bool isApplet = (progId >> 32) == 0x00040030;
+    bool isSysmodule = (progId >> 32) == 0x00040130;
 
     if(isHomeMenu)
     {
@@ -561,12 +898,12 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
 
         switch(progId)
         {
-            case 0x0004003000008F02LL: //USA Home Menu
-            case 0x0004003000008202LL: //JPN Home Menu
-            case 0x0004003000009802LL: //EUR Home Menu
+            case 0x0004003000008F02LL: //USA HOME Menu
+            case 0x0004003000008202LL: //JPN HOME Menu
+            case 0x0004003000009802LL: //EUR HOME Menu
                 if(progVer <= 4) applyRegionFreePatch = false;
                 break;
-            case 0x000400300000A902LL: //KOR Home Menu
+            case 0x000400300000A902LL: //KOR HOME Menu
                 if(!progVer) applyRegionFreePatch = false;
                 break;
         }
@@ -627,50 +964,65 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
              progId == 0x0004001000022000LL || //EUR MSET
              progId == 0x0004001000026000LL || //CHN MSET
              progId == 0x0004001000027000LL || //KOR MSET
-             progId == 0x0004001000028000LL) //TWN MSET
-            && CONFIG(PATCHVERSTRING))
+             progId == 0x0004001000028000LL)) //TWN MSET
     {
-        static const u16 pattern[] = u"Ve";
-        static u16 *patch;
-        u32 patchSize = 0,
-        currentNand = BOOTCFG_NAND;
-
-        u16 customVerString[19];
-        loadCustomVerString(customVerString, &patchSize, currentNand);
-
-        if(patchSize != 0) patch = customVerString;
-        else
+        if (CONFIG(PATCHVERSTRING))
         {
-            patchSize = 8;
-            u32 currentFirm = BOOTCFG_FIRM;
+            static const u16 pattern[] = u"Ve";
+            const u16 *patch;
+            u32 patchSize = 0,
+            currentNand = BOOTCFG_NAND;
 
-            static u16 *verStringsNands[] = { u" Sys",
-                                              u" Emu",
-                                              u"Emu2",
-                                              u"Emu3",
-                                              u"Emu4" },
+            u16 customVerString[19];
+            loadCustomVerString(customVerString, &patchSize, currentNand);
 
-                       *verStringsEmuSys[] = { u"EmuS",
-                                               u"Em2S",
-                                               u"Em3S",
-                                               u"Em4S" },
+            if(patchSize != 0) patch = customVerString;
+            else
+            {
+                patchSize = 8;
 
-                       *verStringsSysEmu[] = { u"SysE",
-                                               u"SyE2",
-                                               u"SyE3",
-                                               u"SyE4" };
+                static const u16 *const verStringNandEmu[] = { u" Emu", u"Emu2", u"Emu3", u"Emu4" };
+                patch = currentNand == 0 ? u" Sys" : verStringNandEmu[BOOTCFG_EMUINDEX];
+            }
 
-            patch = (currentFirm != 0) == (currentNand != 0) ? verStringsNands[currentNand] :
-                                          (!currentNand ? verStringsSysEmu[currentFirm - 1] : verStringsEmuSys[currentNand - 1]);
+            //Patch Ver. string
+            if(!patchMemory(code, textSize,
+                    pattern,
+                    sizeof(pattern) - 2, 0,
+                    patch,
+                    patchSize, 1
+                )) goto error;
         }
 
-        //Patch Ver. string
-        if(!patchMemory(code, textSize,
-                pattern,
-                sizeof(pattern) - 2, 0,
-                patch,
-                patchSize, 1
-            )) goto error;
+        // Allow date picker to select year up to 2099, not just 2050.
+        // NNID user's year-of-birth seems to have a similar restriction,
+        // I'm not removing that as long as any NNID stuff is still active.
+
+        // Patch date picker check on entry (date load):
+        // Look for:
+        // 32 00 5x E3 CMP             Rx, #0x32
+        // ...
+        // 32 x0 A0 C3 MOVGT           Rx, #0x32
+        u32 *off = (u32 *)code;
+        for (; (u8 *)off < code + textSize && ((off[0] & 0xFFF0FFFF) != 0xE3500032 || (off[2] & 0xFFFF0FFF) != 0xC3A00032); off++)
+        {
+            if (((off[0] >> 16) & 0xF) != ((off[2] >> 12) & 0xF)) // ensure same register used
+                continue;
+        }
+        if ((u8 *)off >= code + textSize) goto error;
+        off[0] = (off[0] & ~0xFF) | 99;
+        off[2] = (off[2] & ~0xFF) | 99;
+
+        // Patch date picker actions:
+        // Look for:
+        // 01 00 80 E2 ADD             R0, R0, #1
+        // 32 00 50 E3 CMP             R0, #0x32
+        off = (u32 *)code;
+        for (; (u8 *)off < code + textSize && (off[0] != 0xE2800001 || off[1] != 0xE3500032); off++);
+        if ((u8 *)off >= code + textSize) goto error;
+
+        off[1] = (off[1] & ~0xFF) | 99; // patch increment wrap-around compare instruction
+        off[9] = (off[9] & ~0xFF) | 99; // patch decrement wrap-around conditional move instruction
     }
 
     else if(progId == 0x0004013000008002LL) //NS
@@ -746,7 +1098,7 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
             0x00, 0x26
         };
 
-        //Disable SecureInfo signature check
+        //Disable SecureInfo signature check (redundant)
         if(!patchMemory(code, textSize,
                 pattern,
                 sizeof(pattern), 0,
@@ -784,7 +1136,7 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
             0x00, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1 //mov r0, #0; bx lr
         };
 
-        //Disable CRR0 signature (RSA2048 with SHA256) check and CRO0/CRR0 SHA256 hash checks (section hashes, and hash table)
+        //Disable CRR0 signature (RSA2048 with SHA256) check (redundant) and CRO0/CRR0 SHA256 hash checks (section hashes, and hash table)
         if(!patchMemory(code, textSize,
                 pattern,
                 sizeof(pattern), -9,
@@ -845,6 +1197,7 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
 
     else if((progId & ~0xF0000001ULL) == 0x0004013000001A02LL) //DSP, SAFE_FIRM DSP
     {
+        // This patch is redundant
         static const u8 pattern[] = {
             0xE3, 0x10, 0x10, 0x80, 0xE2
         },
@@ -861,12 +1214,23 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
             )) goto error;
     }
 
-    if(CONFIG(PATCHGAMES))
+    if (isSysmodule && CONFIG(LOADEXTFIRMSANDMODULES))
     {
-        if(!patcherApplyCodeBpsPatch(progId, code, size)) goto error;
-        if(!applyCodeIpsPatch(progId, code, size)) goto error;
+        if(!patcherApplyCodeBpsPatch(code, &codeSize, size, progId)) goto error;
+        if(!applyCodeIpsPatch(code, &codeSize, size, progId)) goto error;
+        if(!applyCodeUpsPatch(code, &codeSize, size, progId)) goto error;
+    }
 
-        if((u32)((progId >> 0x20) & 0xFFFFFFEDULL) == 0x00040000 || isHomeMenu)
+    if(CONFIG(PATCHGAMES) && !(isApp && nextGamePatchDisabled))
+    {
+        if (!isSysmodule)
+        {
+            if(!patcherApplyCodeBpsPatch(code, &codeSize, size, progId)) goto error;
+            if(!applyCodeIpsPatch(code, &codeSize, size, progId)) goto error;
+            if(!applyCodeUpsPatch(code, &codeSize, size, progId)) goto error;
+        }
+
+        if(isApp || isApplet)
         {
             u8 mask,
                regionId,
@@ -874,12 +1238,13 @@ void patchCode(u64 progId, u16 progVer, u8 *code, u32 size, u32 textSize, u32 ro
                countryId,
                stateId;
 
-            if(loadTitleLocaleConfig(progId, &mask, &regionId, &languageId, &countryId, &stateId))
+            if(isLumaWithKext && loadTitleLocaleConfig(progId, &mask, &regionId, &languageId, &countryId, &stateId))
                 svcKernelSetState(0x10001, ((u32)stateId << 24) | ((u32)countryId << 16) | ((u32)languageId << 8) | ((u32)regionId << 4) | (u32)mask , progId);
             if(!patchLayeredFs(progId, code, size, textSize, roSize, dataSize, roAddress, dataAddress)) goto error;
         }
     }
 
+    nextGamePatchDisabled = false;
     return;
 
 error:

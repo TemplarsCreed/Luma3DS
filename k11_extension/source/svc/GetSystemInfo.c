@@ -37,8 +37,17 @@ Result GetSystemInfoHook(s64 *out, s32 type, s32 param)
     {
         case 0x10000:
         {
-            switch(param)
+            if (param >= 0x400 && param < 0x500) {
+                *out = 0;
+                s32 offset = param - 0x400;
+                s32 toCopy = (s32)sizeof(cfwInfo.launchedPath) - offset;
+                if (toCopy > 8) toCopy = 8;
+                memcpy(out, (u8*)cfwInfo.launchedPath + offset, (toCopy > 0) ? toCopy : 0);
+            }
+            else switch(param)
             {
+                // Please do not use these, except 0, 1, and 0x200
+                // Other types may get removed or reordered without notice
                 case 0:
                     *out = SYSTEM_VERSION(cfwInfo.versionMajor, cfwInfo.versionMinor, cfwInfo.versionBuild);
                     break;
@@ -60,7 +69,30 @@ Result GetSystemInfoHook(s64 *out, s32 type, s32 param)
                 case 6:
                     *out = cfwInfo.splashDurationMsec;
                     break;
-
+                case 7:
+                    *out = cfwInfo.volumeSliderOverride;
+                    break;
+                case 8:
+                    *out = (s64)cfwInfo.volumeSliderOverrideStereoBalance;
+                    break;
+                case 9:
+                    *out = cfwInfo.ledMasterBrightnessOverride;
+                    break;
+                case 0xA:
+                    *out = cfwInfo.mcuConfigFlags;
+                    break;
+                case 0x10:
+                    *out = (s64)cfwInfo.autobootTwlTitleId;
+                    break;
+                case 0x11:
+                    *out = cfwInfo.autobootCtrAppmemtype;
+                    break;
+                case 0x12:
+                    *out = cfwInfo.autobootCtrUseNs;
+                    break;
+                case 0x80:
+                    *out = fcramDescriptor->appRegion.regionSizeInBytes;
+                    break;
                 case 0x100:
                     *out = (s64)cfwInfo.hbldr3dsxTitleId;
                     break;
@@ -68,12 +100,54 @@ Result GetSystemInfoHook(s64 *out, s32 type, s32 param)
                     *out = cfwInfo.rosalinaMenuCombo;
                     break;
                 case 0x102:
-                    *out = cfwInfo.screenFiltersCct;
+                    *out = cfwInfo.topScreenFilter.cct;
                     break;
                 case 0x103:
                     *out = (s64)cfwInfo.ntpTzOffetMinutes;
                     break;
-
+                case 0x104:
+                    *out = cfwInfo.topScreenFilter.gammaEnc[0];
+                    break;
+                case 0x105:
+                    *out = cfwInfo.topScreenFilter.contrastEnc[0];
+                    break;
+                case 0x107:
+                    *out = (s64)cfwInfo.topScreenFilter.invert;
+                    break;
+                case 0x108:
+                    *out = cfwInfo.bottomScreenFilter.cct;
+                    break;
+                case 0x109:
+                    *out = cfwInfo.bottomScreenFilter.gammaEnc[0];
+                    break;
+                case 0x10A:
+                    *out = cfwInfo.bottomScreenFilter.contrastEnc[0];
+                    break;
+                case 0x10C:
+                    *out = (s64)cfwInfo.bottomScreenFilter.invert;
+                    break;
+                case 0x110:
+                case 0x111:
+                    *out = cfwInfo.topScreenFilter.gammaEnc[1 + param - 0x110];
+                    break;
+                case 0x112:
+                case 0x113:
+                    *out = cfwInfo.topScreenFilter.contrastEnc[1 + param - 0x112];
+                    break;
+                case 0x114:
+                case 0x115:
+                    *out = cfwInfo.bottomScreenFilter.gammaEnc[1 + param - 0x114];
+                    break;
+                case 0x116:
+                case 0x117:
+                    *out = cfwInfo.bottomScreenFilter.contrastEnc[1 + param - 0x116];
+                    break;
+                case 0x180:
+                    *out = cfwInfo.pluginLoaderFlags;
+                    break;
+                case 0x181:
+                    *out = disableThreadRedirection;
+                    break;
                 case 0x200: // isRelease
                     *out = cfwInfo.flags & 1;
                     break;

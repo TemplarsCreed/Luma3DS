@@ -30,10 +30,22 @@
 
 extern Menu screenFiltersMenu;
 
-extern int screenFiltersCurrentTemperature;
+#define SCREEN_FILTER_MAX_GAMMA     4.0f
+#define SCREEN_FILTER_MAX_CONTRAST  8.0f // contrast above 1 is a gain: channel values reaching 255 are clipped
 
-void ScreenFiltersMenu_SetCct(int cct);
-void ScreenFiltersMenu_RestoreCct(void);
+typedef struct ScreenFilter {
+    u16 cct;
+    bool invert;
+    u8 colorCurveCorrection;
+    float gamma[3];     // per-channel (R, G, B) gamma
+    float contrast[3];  // per-channel (R, G, B) contrast
+} ScreenFilter;
+
+extern ScreenFilter topScreenFilter;
+extern ScreenFilter bottomScreenFilter;
+
+void ScreenFiltersMenu_RestoreSettings(void);
+void ScreenFiltersMenu_LoadConfig(void);
 
 void ScreenFiltersMenu_SetDefault(void);            // 6500K (default)
 
@@ -46,3 +58,10 @@ void ScreenFiltersMenu_SetIncandescent(void);       // 2700K
 void ScreenFiltersMenu_SetWarmIncandescent(void);   // 2300K
 void ScreenFiltersMenu_SetCandle(void);             // 1900K
 void ScreenFiltersMenu_SetEmber(void);              // 1200K
+
+void ScreenFiltersMenu_SetTopScreenSrgbColorCurve(void);
+void ScreenFiltersMenu_RestoreTopScreenColorCurve(void);
+void ScreenFiltersMenu_SetBottomScreenSrgbColorCurve(void);
+void ScreenFiltersMenu_RestoreBottomScreenColorCurve(void);
+
+void ScreenFiltersMenu_AdvancedConfiguration(void);

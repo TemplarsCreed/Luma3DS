@@ -40,6 +40,8 @@
 #define GPU_FB_TOP_RIGHT_ADDR_1     REG32(0x10400494)
 #define GPU_FB_TOP_RIGHT_ADDR_2     REG32(0x10400498)
 
+#define GPU_FB_BOTTOM_VBLANK        REG32(0x10400530)
+#define GPU_FB_BOTTOM_VCOUNT        REG32(0x10400554)
 #define GPU_FB_BOTTOM_ADDR_1        REG32(0x10400568)
 #define GPU_FB_BOTTOM_ADDR_2        REG32(0x1040056C)
 #define GPU_FB_BOTTOM_FMT           REG32(0x10400570)
@@ -77,6 +79,7 @@
 #define COLOR_WHITE RGB565(0x1F, 0x3F, 0x1F)
 #define COLOR_RED   RGB565(0x1F, 0x00, 0x00)
 #define COLOR_GREEN RGB565(0x00, 0x1F, 0x00)
+#define COLOR_LIME  RGB565(0x00, 0xFF, 0x00)
 #define COLOR_BLACK RGB565(0x00, 0x00, 0x00)
 
 #define DRAW_MAX_FORMATTED_STRING_SIZE  512
@@ -107,4 +110,4 @@ u32 Draw_GetCurrentFramebufferAddress(bool top, bool left);
 void Draw_GetCurrentScreenInfo(u32 *width, bool *is3d, bool top);
 
 void Draw_CreateBitmapHeader(u8 *dst, u32 width, u32 heigth);
-void Draw_ConvertFrameBufferLines(u8 *buf, u32 width, u32 startingLine, u32 numLines, bool top, bool left);
+void Draw_ConvertFrameBufferLines(u8 *buf, u32 width, u32 startingLine, u32 numLines, u32 scaleFactorY, bool top, bool left);
